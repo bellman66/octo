@@ -71,6 +71,12 @@ Octo takes a different approach, built on three principles:
 2. **Curate indexes**: pick the contexts relevant to a project and set their order.
 3. **Connect once**: agents call `get_index` to read the table of contents, then `load_context` for the items they need.
 
+The whole flow fits on one screen:
+
+<p align="center">
+  <img src="docs/images/en-main.png" width="880" alt="Octo main screen: contexts on the left, indexes in the middle, and the session panel with the table of contents agents receive on the right">
+</p>
+
 ## Features
 
 ### Three kinds of context
@@ -140,6 +146,12 @@ The app is a single screen that flows from left to right.
 ```text
 ① Contexts ──▶ ② Indexes ──▶ ③ Session
 ```
+
+| Panel | What it shows | What you do there |
+|---|---|---|
+| **① Contexts** | Every registered context, with its kind badge and one-line summary. You can filter by kind or search. | Add and edit contexts, then add them to the selected index with **Add ›**. |
+| **② Indexes** | All indexes as a collapsible list. The ★ default index is marked. | Reorder contexts with ↑ ↓, remove them with ✕, rename or delete an index. |
+| **③ Session** | Claude Code connection status, the MCP address, and a live preview of the table of contents a session receives. | Connect or disconnect Claude Code, or copy the address or JSON for other tools. |
 
 1. In **① Contexts**, click **+ Add** and register a doc, a path, or a graph query.
 2. In **② Indexes**, create an index and add contexts to it. Click **★ Make default** to make it the default.
@@ -218,6 +230,10 @@ The link cache stores two things separately, because they differ in how long the
 - **Failed fetches are remembered for 10 minutes.** During that time Octo doesn't retry, so a broken link can't stall `get_index` with repeated timeouts.
 - **Cleanup follows your edits.** When you delete a context or change its URL, and no other context uses the old URL, its cached result is discarded. Access methods are kept, because other links may still use them.
 - **You can inspect and clear the cache.** Open a link context in the app to see its cache status, and use **Clear cache** or **Clear method**.
+
+<p align="center">
+  <img src="docs/images/en-sheet.png" width="720" alt="Editing a link context: the Link cache panel shows a cached result submitted by claude-code with its version, and the reported access method, each with a clear button">
+</p>
 
 ## Data and configuration
 
