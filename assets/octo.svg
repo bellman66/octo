@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4A95FF"/>
+      <stop offset="1" stop-color="#1B64DA"/>
+    </linearGradient>
+    <radialGradient id="skin" cx="0.35" cy="0.25" r="0.9">
+      <stop offset="0" stop-color="#FFB27A"/>
+      <stop offset="0.55" stop-color="#FF8448"/>
+      <stop offset="1" stop-color="#E8582A"/>
+    </radialGradient>
+    <linearGradient id="arm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FF8A4C"/>
+      <stop offset="1" stop-color="#EE6431"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="58" fill="url(#bg)"/>
+
+  <g transform="rotate(-9 128 132)">
+  <g stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- 뒤쪽 다리 (조금 어둡게) -->
+    <g stroke="#D9542A">
+      <path d="M92 150 C66 150 44 136 36 116" stroke-width="20"/>
+      <path d="M36 116 C30 100 40 88 52 94" stroke-width="12"/>
+      <path d="M164 150 C194 154 214 166 220 186" stroke-width="20"/>
+      <path d="M220 186 C224 202 208 208 204 196" stroke-width="12"/>
+    </g>
+
+    <!-- 앞쪽 다리: 굵게 나와서 끝이 말린다 -->
+    <g stroke="url(#arm)">
+      <path d="M96 158 C74 172 52 186 50 206" stroke-width="22"/>
+      <path d="M50 206 C48 222 66 228 72 214" stroke-width="13"/>
+
+      <path d="M112 166 C104 186 92 206 102 222" stroke-width="22"/>
+      <path d="M102 222 C110 234 126 226 118 214" stroke-width="13"/>
+
+      <path d="M144 166 C156 184 172 200 168 218" stroke-width="22"/>
+      <path d="M168 218 C164 232 148 228 154 216" stroke-width="13"/>
+
+      <path d="M160 158 C182 172 204 186 206 206" stroke-width="22"/>
+      <path d="M206 206 C208 222 190 228 184 214" stroke-width="13"/>
+    </g>
+  </g>
+
+  <!-- 말린 다리 끝 흡반 -->
+  <g fill="#FFE1CC">
+    <circle cx="44" cy="102" r="2.6"/><circle cx="36" cy="112" r="3"/>
+    <circle cx="220" cy="190" r="3"/><circle cx="213" cy="200" r="2.6"/>
+    <circle cx="52" cy="216" r="3"/><circle cx="60" cy="223" r="2.6"/><circle cx="50" cy="205" r="3.2"/>
+    <circle cx="104" cy="226" r="3"/><circle cx="113" cy="229" r="2.6"/><circle cx="100" cy="216" r="3.2"/>
+    <circle cx="166" cy="224" r="3"/><circle cx="158" cy="228" r="2.6"/><circle cx="170" cy="213" r="3.2"/>
+    <circle cx="204" cy="216" r="3"/><circle cx="196" cy="223" r="2.6"/><circle cx="206" cy="205" r="3.2"/>
+  </g>
+
+  <!-- 머리 -->
+  <path d="M128 30 C178 30 204 70 202 112 C200 150 170 170 128 170 C86 170 56 150 54 112 C52 70 78 30 128 30 Z" fill="url(#skin)"/>
+
+  <!-- 머리 무늬와 윤기 -->
+  <g fill="#E8582A" opacity="0.45">
+    <circle cx="160" cy="58" r="7"/>
+    <circle cx="178" cy="80" r="5"/>
+    <circle cx="146" cy="46" r="4"/>
+    <circle cx="172" cy="102" r="3.5"/>
+  </g>
+  <ellipse cx="96" cy="64" rx="20" ry="11" fill="#FFFFFF" opacity="0.35" transform="rotate(-35 96 64)"/>
+
+  <!-- 얼굴 -->
+  <g>
+    <ellipse cx="104" cy="118" rx="14" ry="16" fill="#2A1A16"/>
+    <ellipse cx="152" cy="118" rx="14" ry="16" fill="#2A1A16"/>
+    <circle cx="109" cy="111" r="5.5" fill="#FFFFFF"/>
+    <circle cx="157" cy="111" r="5.5" fill="#FFFFFF"/>
+    <circle cx="99" cy="125" r="2.4" fill="#FFFFFF"/>
+    <circle cx="147" cy="125" r="2.4" fill="#FFFFFF"/>
+    <ellipse cx="84" cy="140" rx="11" ry="6.5" fill="#FF5E6C" opacity="0.5"/>
+    <ellipse cx="172" cy="140" rx="11" ry="6.5" fill="#FF5E6C" opacity="0.5"/>
+    <path d="M120 140 Q128 148 136 140" stroke="#2A1A16" stroke-width="4" stroke-linecap="round" fill="none"/>
+  </g>
+  </g>
+</svg>
