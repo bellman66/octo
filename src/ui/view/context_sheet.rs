@@ -119,9 +119,12 @@ pub fn view<'a>(app: &'a App, editor: &'a ContextEditor) -> Element<'a, Message>
 /// 링크의 캐시 상태: 조회 결과와 에이전트가 남긴 접근 방식
 fn cache_panel(info: &cache::Info) -> Element<'_, Message> {
     let line = |label: &'static str, value: Element<'static, Message>, clear: Option<(&'static str, Message)>| {
-        let mut r = row![text(label).size(13).font(BOLD).color(theme::GREY700).width(72), value].spacing(8).align_y(Center);
+        // 설명은 남은 폭 안에서 줄바꿈해 지우기 버튼이 밀려나지 않게 한다
+        let mut r = row![text(label).size(13).font(BOLD).color(theme::GREY700).width(72), container(value).width(Fill)]
+            .spacing(8)
+            .align_y(Center);
         if let Some((label, message)) = clear {
-            r = r.push(space::horizontal()).push(ghost_button(label, message));
+            r = r.push(ghost_button(label, message));
         }
         r
     };
