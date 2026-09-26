@@ -1,0 +1,109 @@
+# Windows와 macOS 실행 파일을 함께 빌드한다.
+# - 태그(v*)를 푸시하면 빌드 후 GitHub Release에 올린다.
+# - Actions 탭에서 직접 실행(workflow_dispatch)하면 빌드만 하고 결과는 Artifacts로 남긴다.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      # VC++ 런타임을 exe에 넣어, 런타임이 없는 PC에서도 실행되게 한다
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -Path target/release/octo.exe -DestinationPath dist/octo-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octo-windows-x64
+          path: dist/*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (Apple Silicon + Intel)
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Bundle Octo.app (universal)
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          APP=dist/Octo.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create -output "$APP/Contents/MacOS/octo" \
+            target/aarch64-apple-darwin/release/octo \
+            target/x86_64-apple-darwin/release/octo
+
+          # 아이콘: assets/octo.svg → .icns
+          brew install librsvg >/dev/null
+          ICONSET=$(mktemp -d)/octo.iconset
+          mkdir -p "$ICONSET"
+          for size in 16 32 128 256 512; do
+            rsvg-convert -w $size -h $size assets/octo.svg -o "$ICONSET/icon_${size}x${size}.png"
+            rsvg-convert -w $((size * 2)) -h $((size * 2)) assets/octo.svg -o "$ICONSET/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/octo.icns"
+
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Octo</string>
+            <key>CFBundleDisplayName</key><string>Octo</string>
+            <key>CFBundleIdentifier</key><string>com.github.bellman66.octo</string>
+            <key>CFBundleExecutable</key><string>octo</string>
+            <key>CFBundleIconFile</key><string>octo</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          # 서명하지 않은 앱이라도 Apple Silicon에서 실행되도록 ad-hoc 서명
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" dist/octo-macos-universal.zip
+          rm -rf "$APP"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octo-macos-universal
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
