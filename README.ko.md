@@ -192,6 +192,8 @@ claude mcp add --transport http --scope user octo http://127.0.0.1:47614/mcp
 | `list_indexes` | 없음 | 쓸 수 있는 인덱스 목록. 현재 인덱스와 기본 인덱스를 표시합니다. |
 | `use_index` | `name` | 이 세션에서만 인덱스를 바꿉니다. |
 | `report_access` | `id`, `method`, `content?`, `version?` | Octo가 가져오지 못한 링크를 에이전트가 어떻게 열었는지, 필요하면 읽은 본문까지 남깁니다. |
+| `add_context` | `title`, `summary?`, `body` 또는 `path` | 다음 세션도 알아야 할 내용을 현재 인덱스에 새 컨텍스트로 남깁니다. 인덱스에 같은 제목이 있으면 거절합니다. |
+| `update_context` | `id`, `title?`, `summary?`, `body?`, `path?` | 에이전트가 만든 컨텍스트를 고칩니다. 사람이 앱에서 한 번 저장하면 더는 에이전트가 바꿀 수 없습니다. |
 
 에이전트가 `get_index`로 받는 목차는 이런 모양입니다.
 

@@ -116,6 +116,9 @@ pub fn toc(store: &Store, index_name: &str) -> Result<String, String> {
         if let Source::Path { path } = &context.source {
             out.push_str(&format!("   path: {path}\n"));
         }
+        if let Some(author) = &context.author {
+            out.push_str(&tr!("   작성: 에이전트({author}) · update_context로 고칠 수 있음\n", "   author: agent ({author}) · editable with update_context\n"));
+        }
         if let Some(status) = entry.broken.or(entry.cached) {
             // 힌트가 여러 줄이면 목록 들여쓰기에 맞춘다
             let status = status.replace('\n', "\n     ");

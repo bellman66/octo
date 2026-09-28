@@ -137,6 +137,7 @@ pub enum Message {
     WindowOpened(window::Id),
     WindowClosed(window::Id),
     Tray(TrayAction),
+    StoreChanged,
     LanguagePicked(Lang),
     DismissToast(u64),
     ToggleHelp(Help),
@@ -251,6 +252,8 @@ impl App {
             instance::subscription().map(|()| Message::Tray(TrayAction::Show)),
             // 창을 닫은 뒤 Dock 아이콘을 눌러도 창을 띄운다
             dock::subscription().map(|()| Message::Tray(TrayAction::Show)),
+            // 에이전트가 MCP로 컨텍스트를 넣거나 고치면 목록과 목차를 다시 읽는다
+            mcp::changes().map(|()| Message::StoreChanged),
         ])
     }
 
@@ -319,6 +322,10 @@ impl App {
                 };
             }
             Message::Tray(TrayAction::Quit) => return iced::exit(),
+            Message::StoreChanged => {
+                self.refresh();
+                return self.load_toc();
+            }
             Message::LanguagePicked(lang) => {
                 i18n::set(lang);
                 if let Err(err) = self.store.set_language(lang) {
@@ -778,6 +785,8 @@ impl App {
             title,
             summary: editor.summary.trim().to_owned(),
             source,
+            // 사람이 저장하면 사람 것이 된다
+            author: None,
         };
         let body = editor.body.text();
         let old_path = editor.id.as_deref().and_then(|id| self.store.context(id)).and_then(|c| path_of(&c));

@@ -191,6 +191,8 @@ claude mcp add --transport http --scope user octo http://127.0.0.1:47614/mcp
 | `list_indexes` | none | Available indexes. Marks the current and default ones. |
 | `use_index` | `name` | Switches the index for this session only. |
 | `report_access` | `id`, `method`, `content?`, `version?` | Records how the agent opened a link Octo couldn't fetch, and optionally what it read. |
+| `add_context` | `title`, `summary?`, `body` or `path` | Saves something later sessions should know as a new context in the current index. Rejects a title that already exists in the index. |
+| `update_context` | `id`, `title?`, `summary?`, `body?`, `path?` | Edits a context an agent created. Once a person saves it in the app, agents can no longer change it. |
 
 Here is an example of what an agent receives from `get_index`:
 

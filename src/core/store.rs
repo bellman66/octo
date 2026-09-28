@@ -93,6 +93,10 @@ pub struct Context {
     #[serde(default)]
     pub summary: String,
     pub source: Source,
+    /// MCP로 에이전트가 만든 항목이면 그 클라이언트 이름. 사람이 앱에서 저장하면 지워지고,
+    /// 그때부터는 에이전트가 `update_context`로 고칠 수 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,7 +384,7 @@ mod tests {
     }
 
     fn doc(id: &str) -> Context {
-        Context { id: id.into(), title: id.into(), summary: String::new(), source: Source::Document }
+        Context { id: id.into(), title: id.into(), summary: String::new(), source: Source::Document, author: None }
     }
 
     #[test]

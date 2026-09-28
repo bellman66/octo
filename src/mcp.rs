@@ -7,13 +7,17 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use futures::channel::mpsc;
+use futures::Stream;
+use iced::Subscription;
 use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use crate::core::store::{self, Source, Store};
+use crate::core::store::{self, Context, Source, Store};
 use crate::core::{cache, content, web};
 use crate::i18n::t;
 use crate::tr;
@@ -43,6 +47,25 @@ struct Session {
 
 /// 세션 id → 세션
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
+
+static CHANGED: Mutex<Option<mpsc::UnboundedSender<()>>> = Mutex::new(None);
+
+/// 에이전트가 컨텍스트나 인덱스를 바꿀 때마다 이벤트를 낸다. 열린 창이 목록을 다시 읽는 데 쓴다.
+pub fn changes() -> Subscription<()> {
+    Subscription::run(change_events)
+}
+
+fn change_events() -> impl Stream<Item = ()> {
+    let (tx, rx) = mpsc::unbounded();
+    *CHANGED.lock().unwrap() = Some(tx);
+    rx
+}
+
+fn notify_changed() {
+    if let Some(tx) = CHANGED.lock().ok().and_then(|tx| tx.clone()) {
+        let _ = tx.unbounded_send(());
+    }
+}
 
 /// 백그라운드 스레드에서 서버를 띄운다. 포트를 못 잡으면 사유를 돌려준다.
 pub fn spawn(store: Store, port: u16) -> Result<(), String> {
@@ -171,11 +194,13 @@ fn initialize(ctx: &Ctx, params: &Value) -> Value {
             "Octo 컨텍스트 인덱스 '{index}'가 연결되어 있습니다. \
              작업 전에 get_index로 목차를 보고, 필요한 항목만 load_context로 본문을 가져오세요. \
              사용자가 다른 인덱스를 원하면 list_indexes로 확인하고 use_index로 바꾸세요. \
-             octo가 열지 못한 링크를 다른 도구로 읽었다면 report_access로 방식과 본문을 남기세요.",
+             octo가 열지 못한 링크를 다른 도구로 읽었다면 report_access로 방식과 본문을 남기세요. \
+             작업 중 다음 세션도 알아야 할 내용을 알게 되면 add_context로 남기고, 직접 남긴 항목은 update_context로 고치세요.",
             "The Octo context index '{index}' is connected. \
              Before working, call get_index to see the table of contents, then load only the items you need with load_context. \
              If the user wants a different index, check list_indexes and switch with use_index. \
-             If you read a link octo couldn't open with another tool, leave the method and content with report_access."
+             If you read a link octo couldn't open with another tool, leave the method and content with report_access. \
+             When you learn something later sessions should know, save it with add_context, and fix items you saved with update_context."
         ),
         None => t(
             "Octo에 아직 인덱스가 없습니다. 사용자에게 앱에서 인덱스를 만들어 달라고 안내하세요.",
@@ -251,6 +276,49 @@ fn tools() -> Value {
                 "required": ["id", "method"],
             },
         },
+        {
+            "name": "add_context",
+            "description": t(
+                "다음 세션도 알아야 할 내용을 이 세션의 인덱스에 새 컨텍스트로 남긴다. \
+                 먼저 get_index로 비슷한 항목이 있는지 보고, 있으면 update_context를 쓴다. \
+                 이미 파일이나 링크로 있는 내용은 복사하지 말고 path로 가리킨다. \
+                 body는 결정 사항, 조사 결과처럼 어디에도 없는 내용에만 쓴다. body와 path 중 하나만 준다.",
+                "Save something later sessions should know as a new context in this session's index. \
+                 Check get_index for a similar item first and use update_context if there is one. \
+                 Don't copy content that already lives in a file or link; point to it with path. \
+                 Use body only for things that exist nowhere else, such as decisions or findings. Give exactly one of body or path.",
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": t("목차에 보일 제목", "Title shown in the table of contents") },
+                    "summary": { "type": "string", "description": t("목차에 보일 한 줄 요약. 없으면 본문 첫 줄", "One-line summary for the table of contents. Defaults to the first line") },
+                    "body": { "type": "string", "description": t("문서 본문 (Markdown)", "Document text (Markdown)") },
+                    "path": { "type": "string", "description": t("원본 파일·폴더의 절대 경로나 링크(URL)", "Absolute path to the source file or folder, or a link (URL)") },
+                },
+                "required": ["title"],
+            },
+        },
+        {
+            "name": "update_context",
+            "description": t(
+                "에이전트가 add_context로 남긴 컨텍스트를 고친다. 사람이 만들거나 고친 항목은 바꿀 수 없다. \
+                 준 값만 바뀐다. body는 문서, path는 경로 컨텍스트에만 줄 수 있다.",
+                "Edit a context an agent saved with add_context. Items a person created or edited can't be changed. \
+                 Only the fields you pass change. body applies to doc contexts, path to path contexts.",
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": t("get_index 목차의 id", "id from the get_index table of contents") },
+                    "title": { "type": "string", "description": t("새 제목", "New title") },
+                    "summary": { "type": "string", "description": t("새 한 줄 요약. 빈 문자열이면 본문 첫 줄로 돌아간다", "New one-line summary. An empty string falls back to the first line") },
+                    "body": { "type": "string", "description": t("새 문서 본문 전체 (Markdown)", "Full new document text (Markdown)") },
+                    "path": { "type": "string", "description": t("새 절대 경로나 링크(URL)", "New absolute path or link (URL)") },
+                },
+                "required": ["id"],
+            },
+        },
     ])
 }
 
@@ -274,6 +342,8 @@ fn call(ctx: &Ctx, params: &Value) -> Value {
         Some("list_indexes") => Ok(list_indexes(ctx)),
         Some("report_access") => ctx.index().ok_or_else(no_index).and_then(|index| report_access(ctx, &index, &params["arguments"])),
         Some("use_index") => use_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
+        Some("add_context") => ctx.index().ok_or_else(no_index).and_then(|index| add_context(ctx, &index, &params["arguments"])),
+        Some("update_context") => ctx.index().ok_or_else(no_index).and_then(|index| update_context(ctx, &index, &params["arguments"])),
         other => Err(tr!("알 수 없는 도구: {}", "Unknown tool: {}", other.unwrap_or(""))),
     };
     tool_result(result)
@@ -343,6 +413,137 @@ fn report_access(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, St
     .into())
 }
 
+fn add_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, String> {
+    let title = text_arg(args, "title").ok_or(t("title 인자가 필요합니다", "The title argument is required"))?;
+    let body = args["body"].as_str().filter(|b| !b.trim().is_empty());
+    let source = match (body, text_arg(args, "path")) {
+        (Some(_), None) => Source::Document,
+        (None, Some(path)) => Source::Path { path: checked_path(path)? },
+        _ => return Err(t("body와 path 중 하나만 주세요", "Give exactly one of body or path").into()),
+    };
+    let mut index = ctx.store.index(index_name).ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
+    if let Some(existing) = same_title(ctx.store, &index.contexts, &title, None) {
+        return Err(duplicate(index_name, &existing));
+    }
+
+    let context = Context {
+        id: store::new_id(),
+        title,
+        summary: text_arg(args, "summary").unwrap_or_default(),
+        source,
+        author: Some(ctx.client()),
+    };
+    let saved = ctx.store.save_context(&context).and_then(|()| match body {
+        Some(body) => ctx.store.save_document(&context.id, body),
+        None => Ok(()),
+    });
+    saved.map_err(|err| tr!("저장하지 못했습니다: {err}", "Couldn't save: {err}"))?;
+    index.contexts.push(context.id.clone());
+    ctx.store.save_index(&index).map_err(|err| tr!("인덱스에 넣지 못했습니다: {err}", "Couldn't add it to the index: {err}"))?;
+
+    notify_changed();
+    Ok(tr!("'{index_name}' 인덱스에 추가했습니다. id: {}", "Added to the '{index_name}' index. id: {}", context.id))
+}
+
+fn update_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, String> {
+    let id = args["id"].as_str().ok_or(t("id 인자가 필요합니다", "The id argument is required"))?;
+    let index = ctx.store.index(index_name).ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
+    if !index.contexts.iter().any(|c| c == id) {
+        return Err(tr!("'{index_name}' 인덱스에 없는 컨텍스트: {id}", "Context not in index '{index_name}': {id}"));
+    }
+    let mut context = ctx.store.context(id).ok_or_else(|| tr!("컨텍스트 없음: {id}", "No context: {id}"))?;
+    if context.author.is_none() {
+        return Err(t(
+            "사람이 만들거나 고친 컨텍스트는 고칠 수 없습니다. 바꿀 내용을 사용자에게 알려 주세요",
+            "Contexts a person created or edited can't be changed. Tell the user what should change",
+        )
+        .into());
+    }
+
+    let title = text_arg(args, "title");
+    let summary = args["summary"].as_str().map(|s| s.trim().to_owned());
+    let body = args["body"].as_str().filter(|b| !b.trim().is_empty());
+    let path = text_arg(args, "path").map(checked_path).transpose()?;
+    if title.is_none() && summary.is_none() && body.is_none() && path.is_none() {
+        return Err(t("바꿀 값이 없습니다 (title, summary, body, path 중 하나 이상)", "Nothing to change (pass title, summary, body, or path)").into());
+    }
+    if let Some(title) = &title
+        && let Some(existing) = same_title(ctx.store, &index.contexts, title, Some(id))
+    {
+        return Err(duplicate(index_name, &existing));
+    }
+
+    let mut old_url = None;
+    match (&mut context.source, body, path) {
+        (Source::Document, _, None) | (Source::Path { .. }, None, None) => {}
+        (Source::Path { path: current }, None, Some(path)) => {
+            if web::is_url(current) {
+                old_url = Some(current.clone());
+            }
+            *current = path;
+        }
+        (Source::Document, _, Some(_)) => return Err(t("문서 컨텍스트에는 path를 줄 수 없습니다", "Doc contexts don't take a path").into()),
+        _ => return Err(t("body는 문서 컨텍스트에만 줄 수 있습니다", "body only applies to doc contexts").into()),
+    }
+    if let Some(title) = title {
+        context.title = title;
+    }
+    if let Some(summary) = summary {
+        context.summary = summary;
+    }
+    context.author = Some(ctx.client());
+
+    let saved = ctx.store.save_context(&context).and_then(|()| match body {
+        Some(body) => ctx.store.save_document(&context.id, body),
+        None => Ok(()),
+    });
+    saved.map_err(|err| tr!("저장하지 못했습니다: {err}", "Couldn't save: {err}"))?;
+    // 링크를 바꿨으면 옛 링크의 조회 결과는 더 쓸 데가 없다
+    if let Some(old) = old_url {
+        cache::forget_if_unused(ctx.store, &old);
+    }
+
+    notify_changed();
+    Ok(tr!("고쳤습니다: {} (id: {id})", "Updated: {} (id: {id})", context.title))
+}
+
+fn text_arg(args: &Value, name: &str) -> Option<String> {
+    args[name].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+/// 링크이거나 실제로 있는 절대 경로만 받는다. 없는 경로는 목차에 바로 "연결 끊김"으로 뜬다.
+fn checked_path(path: String) -> Result<String, String> {
+    if web::is_url(&path) || (Path::new(&path).is_absolute() && Path::new(&path).exists()) {
+        Ok(path)
+    } else {
+        Err(tr!("있는 절대 경로나 링크(URL)가 필요합니다: {path}", "Needs an existing absolute path or a link (URL): {path}"))
+    }
+}
+
+/// 인덱스 안에서 제목이 같은(대소문자 무시) 다른 컨텍스트
+fn same_title(store: &Store, ids: &[String], title: &str, except: Option<&str>) -> Option<Context> {
+    ids.iter()
+        .filter(|id| Some(id.as_str()) != except)
+        .filter_map(|id| store.context(id))
+        .find(|c| c.title.trim().eq_ignore_ascii_case(title.trim()))
+}
+
+fn duplicate(index_name: &str, existing: &Context) -> String {
+    if existing.author.is_some() {
+        tr!(
+            "'{index_name}' 인덱스에 같은 제목이 있습니다 (id: {}). update_context로 고치세요",
+            "The '{index_name}' index already has this title (id: {}). Use update_context instead",
+            existing.id
+        )
+    } else {
+        tr!(
+            "'{index_name}' 인덱스에 사람이 만든 같은 제목의 항목이 있습니다 (id: {}). 바꿀 내용은 사용자에게 알려 주세요",
+            "The '{index_name}' index already has a person-made item with this title (id: {}). Tell the user what should change",
+            existing.id
+        )
+    }
+}
+
 fn tool_result(result: Result<String, String>) -> Value {
     let (text, is_error) = match result {
         Ok(text) => (text, false),
@@ -378,4 +579,82 @@ fn respond_json(request: Request, value: &Value, session: Option<&str>) {
         response = response.with_header(Header::from_bytes("Mcp-Session-Id", session).expect("session header"));
     }
     let _ = request.respond(response);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::store::Index;
+
+    fn setup(name: &str) -> (Store, Sessions) {
+        let root = std::env::temp_dir().join(format!("octo-mcp-test-{name}-{}", store::new_id()));
+        let store = Store::at(root).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec![] }).unwrap();
+        (store, Sessions::default())
+    }
+
+    fn ctx<'a>(store: &'a Store, sessions: &'a Sessions) -> Ctx<'a> {
+        Ctx { store, sessions, session: None, pinned: Some("x".into()) }
+    }
+
+    #[test]
+    fn added_context_joins_the_index_as_agent_authored() {
+        let (store, sessions) = setup("add");
+        let ctx = ctx(&store, &sessions);
+        let reply = add_context(&ctx, "x", &json!({ "title": "결제 정책", "body": "환불은 7일" })).unwrap();
+
+        let index = store.index("x").unwrap();
+        assert_eq!(index.contexts.len(), 1);
+        let context = store.context(&index.contexts[0]).unwrap();
+        assert!(reply.contains(&context.id));
+        assert!(context.author.is_some());
+        assert_eq!(store.document(&context.id), "환불은 7일");
+        // 같은 제목은 새로 만들지 않는다
+        assert!(add_context(&ctx, "x", &json!({ "title": " 결제 정책 ", "body": "다른 내용" })).is_err());
+    }
+
+    #[test]
+    fn add_needs_exactly_one_existing_source() {
+        let (store, sessions) = setup("source");
+        let ctx = ctx(&store, &sessions);
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        assert!(add_context(&ctx, "x", &json!({ "title": "a" })).is_err());
+        assert!(add_context(&ctx, "x", &json!({ "title": "a", "body": "b", "path": dir })).is_err());
+        assert!(add_context(&ctx, "x", &json!({ "title": "a", "path": "/definitely/not/here" })).is_err());
+        assert!(add_context(&ctx, "x", &json!({ "title": "a", "path": "relative/path" })).is_err());
+        assert!(add_context(&ctx, "x", &json!({ "title": "a", "path": dir })).is_ok());
+    }
+
+    #[test]
+    fn tools_are_listed_and_dispatched() {
+        let (store, sessions) = setup("dispatch");
+        let ctx = ctx(&store, &sessions);
+        let names: Vec<_> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
+        assert!(names.contains(&"add_context".into()) && names.contains(&"update_context".into()));
+
+        let reply = call(&ctx, &json!({ "name": "add_context", "arguments": { "title": "t", "body": "b" } }));
+        assert_eq!(reply["isError"], false);
+        let toc = call(&ctx, &json!({ "name": "get_index" }));
+        assert!(toc["content"][0]["text"].as_str().unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn update_only_touches_agent_contexts() {
+        let (store, sessions) = setup("update");
+        let ctx = ctx(&store, &sessions);
+        let human = Context { id: "h".into(), title: "h".into(), summary: String::new(), source: Source::Document, author: None };
+        store.save_context(&human).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec!["h".into()] }).unwrap();
+        assert!(update_context(&ctx, "x", &json!({ "id": "h", "body": "x" })).is_err());
+
+        add_context(&ctx, "x", &json!({ "title": "note", "body": "v1" })).unwrap();
+        let id = store.index("x").unwrap().contexts[1].clone();
+        assert!(update_context(&ctx, "x", &json!({ "id": id })).is_err());
+        assert!(update_context(&ctx, "x", &json!({ "id": id, "path": std::env::temp_dir() })).is_err());
+        // 사람이 만든 항목과 같은 제목으로는 못 바꾼다
+        assert!(update_context(&ctx, "x", &json!({ "id": id, "title": "H" })).is_err());
+        update_context(&ctx, "x", &json!({ "id": id, "body": "v2", "summary": "요약" })).unwrap();
+        assert_eq!(store.document(&id), "v2");
+        assert_eq!(store.context(&id).unwrap().summary, "요약");
+    }
 }

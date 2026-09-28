@@ -88,6 +88,9 @@ fn context_row<'a>(app: &'a App, row_data: &'a Row) -> Element<'a, Message> {
     if !row_data.summary.is_empty() {
         info = info.push(caption(row_data.summary.as_str()));
     }
+    if let Some(author) = &context.author {
+        info = info.push(caption(crate::tr!("에이전트 작성 · {author}", "Added by agent · {author}")));
+    }
     if let Some(reason) = &row_data.broken {
         info = info.push(error(format!("⚠ {reason}")));
     }
