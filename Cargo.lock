@@ -2892,6 +2892,7 @@ dependencies = [
  "futures",
  "iced",
  "keyring",
+ "objc2 0.6.4",
  "resvg",
  "serde",
  "serde_json",

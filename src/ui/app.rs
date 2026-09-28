@@ -9,6 +9,7 @@ use tray_icon::TrayIcon;
 use crate::core::store::{self, Connection, Context, DeleteBlocked, Index, Kind, Source, Store};
 use crate::core::{cache, content, graph, secret, web};
 use crate::daemon::claude;
+use crate::daemon::dock;
 use crate::daemon::tray::{self, TrayAction};
 use crate::i18n::{self, Lang};
 use crate::tr;
@@ -248,6 +249,8 @@ impl App {
             tray::subscription().map(Message::Tray),
             // 두 번째 실행은 종료되고, 대신 이 인스턴스의 창을 띄운다
             instance::subscription().map(|()| Message::Tray(TrayAction::Show)),
+            // 창을 닫은 뒤 Dock 아이콘을 눌러도 창을 띄운다
+            dock::subscription().map(|()| Message::Tray(TrayAction::Show)),
         ])
     }
 
@@ -298,6 +301,7 @@ impl App {
                 // boot가 아니라 첫 창이 열린 시점에 생성한다
                 if self.tray.is_none() {
                     self.tray = Some(tray::create());
+                    dock::install();
                 }
                 self.refresh();
                 return self.load_toc();
