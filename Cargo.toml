@@ -18,3 +18,18 @@ ureq = { version = "3.4.2", features = ["json"] }
 [build-dependencies]
 resvg = "0.48.1"
 winresource = "0.1.31"
+
+# cargo packager --release → dist/Octo.app, dist/Octo_<ver>_<arch>.dmg
+[package.metadata.packager]
+product-name = "Octo"
+identifier = "com.github.bellman66.octo"
+before-packaging-command = "cargo build --release --locked"
+out-dir = "dist"
+# octo.svg에서 512px로 렌더한 것 (1024px은 packager가 icns로 변환 못 함)
+icons = ["assets/octo.png"]
+formats = ["app", "dmg"]
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
+# ad-hoc 서명: 인증서 없이도 Apple Silicon에서 실행되게
+signing-identity = "-"

@@ -41,58 +41,27 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager
       - name: Build (Apple Silicon + Intel)
+        # arm64는 호스트 빌드(target/release)로 둬서, packager의 before-packaging-command가 캐시로 끝나게 한다
         run: |
-          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked
           cargo build --release --locked --target x86_64-apple-darwin
-      - name: Bundle Octo.app (universal)
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
-          APP=dist/Octo.app
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          lipo -create -output "$APP/Contents/MacOS/octo" \
-            target/aarch64-apple-darwin/release/octo \
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output target/universal-apple-darwin/release/octo \
+            target/release/octo \
             target/x86_64-apple-darwin/release/octo
-
-          # 아이콘: assets/octo.svg → .icns
-          brew install librsvg >/dev/null
-          ICONSET=$(mktemp -d)/octo.iconset
-          mkdir -p "$ICONSET"
-          for size in 16 32 128 256 512; do
-            rsvg-convert -w $size -h $size assets/octo.svg -o "$ICONSET/icon_${size}x${size}.png"
-            rsvg-convert -w $((size * 2)) -h $((size * 2)) assets/octo.svg -o "$ICONSET/icon_${size}x${size}@2x.png"
-          done
-          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/octo.icns"
-
-          cat > "$APP/Contents/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>Octo</string>
-            <key>CFBundleDisplayName</key><string>Octo</string>
-            <key>CFBundleIdentifier</key><string>com.github.bellman66.octo</string>
-            <key>CFBundleExecutable</key><string>octo</string>
-            <key>CFBundleIconFile</key><string>octo</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-            <key>CFBundleVersion</key><string>${VERSION}</string>
-            <key>LSMinimumSystemVersion</key><string>11.0</string>
-            <key>NSHighResolutionCapable</key><true/>
-          </dict>
-          </plist>
-          EOF
-
-          # 서명하지 않은 앱이라도 Apple Silicon에서 실행되도록 ad-hoc 서명
-          codesign --force --deep --sign - "$APP"
-          ditto -c -k --keepParent "$APP" dist/octo-macos-universal.zip
-          rm -rf "$APP"
+      # 설정은 Cargo.toml [package.metadata.packager]
+      - name: Package Octo.app + dmg (universal)
+        run: cargo packager --release --target universal-apple-darwin
       - uses: actions/upload-artifact@v4
         with:
           name: octo-macos-universal
-          path: dist/*
+          path: dist/*.dmg
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
