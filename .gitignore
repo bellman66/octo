@@ -10,8 +10,9 @@
 *.swp
 *~
 
-# AI agent local settings
-.claude/
+# AI agent local settings (skills are shared)
+.claude/*
+!.claude/skills/
 
 # OS
 .DS_Store
