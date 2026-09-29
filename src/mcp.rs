@@ -195,16 +195,18 @@ fn initialize(ctx: &Ctx, params: &Value) -> Value {
              작업 전에 get_index로 목차를 보고, 필요한 항목만 load_context로 본문을 가져오세요. \
              사용자가 다른 인덱스를 원하면 list_indexes로 확인하고 use_index로 바꾸세요. \
              octo가 열지 못한 링크를 다른 도구로 읽었다면 report_access로 방식과 본문을 남기세요. \
-             작업 중 다음 세션도 알아야 할 내용을 알게 되면 add_context로 남기고, 직접 남긴 항목은 update_context로 고치세요.",
+             작업 중 다음 세션도 알아야 할 내용을 알게 되면 add_context로 남기고, 직접 남긴 항목은 update_context·delete_context로 고치거나 지우세요. \
+             인덱스는 create_index·update_index·delete_index로 관리합니다. 사람이 만든 항목은 바꾸지 못하니 바꿀 내용을 사용자에게 알려 주세요.",
             "The Octo context index '{index}' is connected. \
              Before working, call get_index to see the table of contents, then load only the items you need with load_context. \
              If the user wants a different index, check list_indexes and switch with use_index. \
              If you read a link octo couldn't open with another tool, leave the method and content with report_access. \
-             When you learn something later sessions should know, save it with add_context, and fix items you saved with update_context."
+             When you learn something later sessions should know, save it with add_context, and fix or delete items you saved with update_context and delete_context. \
+             Manage indexes with create_index, update_index, and delete_index. Person-made items can't be changed; tell the user what should change."
         ),
         None => t(
-            "Octo에 아직 인덱스가 없습니다. 사용자에게 앱에서 인덱스를 만들어 달라고 안내하세요.",
-            "Octo has no index yet. Ask the user to create one in the app.",
+            "Octo에 아직 인덱스가 없습니다. 사용자가 원하면 create_index로 만들고 add_context로 채우세요.",
+            "Octo has no index yet. If the user wants one, create it with create_index and fill it with add_context.",
         )
         .into(),
     };
@@ -319,14 +321,68 @@ fn tools() -> Value {
                 "required": ["id"],
             },
         },
+        {
+            "name": "delete_context",
+            "description": t(
+                "에이전트가 남긴 컨텍스트를 지운다. 담겨 있던 모든 인덱스에서도 빠진다. 사람이 만들거나 고친 항목은 지울 수 없다.",
+                "Delete a context an agent saved. It is also removed from every index. Items a person created or edited can't be deleted.",
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": t("get_index 목차의 id", "id from the get_index table of contents") } },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "create_index",
+            "description": t(
+                "빈 인덱스를 만들고 이 세션이 그 인덱스를 쓰게 한다. 이름은 영문·숫자·-·_ (64자 이내).",
+                "Create an empty index and switch this session to it. Names use letters, numbers, - and _ (up to 64).",
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": t("새 인덱스 이름", "New index name") } },
+                "required": ["name"],
+            },
+        },
+        {
+            "name": "update_index",
+            "description": t(
+                "인덱스 목차에 기존 컨텍스트를 넣거나 빼고, 이름을 바꾼다. name을 빼면 이 세션의 인덱스. \
+                 넣기는 어느 인덱스든 되고, 빼기는 인덱스나 컨텍스트가 에이전트 것일 때만, 이름 바꾸기는 에이전트가 만든 인덱스만 된다.",
+                "Add existing contexts to an index's table of contents, remove them, or rename it. Omit name for this session's index. \
+                 Adding works on any index; removing needs the index or the context to be agent-made; renaming needs an agent-made index.",
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": t("고칠 인덱스 이름", "Index to edit") },
+                    "new_name": { "type": "string", "description": t("새 이름", "New name") },
+                    "add": { "type": "array", "items": { "type": "string" }, "description": t("목차 끝에 넣을 컨텍스트 id", "Context ids to append") },
+                    "remove": { "type": "array", "items": { "type": "string" }, "description": t("목차에서 뺄 컨텍스트 id (컨텍스트는 남는다)", "Context ids to take out (the contexts remain)") },
+                },
+            },
+        },
+        {
+            "name": "delete_index",
+            "description": t(
+                "에이전트가 만든 인덱스를 지운다. 담겨 있던 컨텍스트는 남는다. 사람이 만들거나 고친 인덱스는 지울 수 없다.",
+                "Delete an index an agent created. Its contexts remain. Indexes a person created or edited can't be deleted.",
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": t("지울 인덱스 이름", "Index to delete") } },
+                "required": ["name"],
+            },
+        },
     ])
 }
 
 fn call(ctx: &Ctx, params: &Value) -> Value {
     let no_index = || {
         t(
-            "Octo에 인덱스가 없습니다. 앱에서 인덱스를 먼저 만들어 주세요",
-            "Octo has no index. Create one in the app first",
+            "Octo에 인덱스가 없습니다. create_index로 만들거나 앱에서 먼저 만들어 주세요",
+            "Octo has no index. Create one with create_index or in the app first",
         )
         .to_owned()
     };
@@ -344,6 +400,10 @@ fn call(ctx: &Ctx, params: &Value) -> Value {
         Some("use_index") => use_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
         Some("add_context") => ctx.index().ok_or_else(no_index).and_then(|index| add_context(ctx, &index, &params["arguments"])),
         Some("update_context") => ctx.index().ok_or_else(no_index).and_then(|index| update_context(ctx, &index, &params["arguments"])),
+        Some("delete_context") => ctx.index().ok_or_else(no_index).and_then(|index| delete_context(ctx, &index, &params["arguments"])),
+        Some("create_index") => create_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
+        Some("update_index") => update_index(ctx, &params["arguments"]),
+        Some("delete_index") => delete_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
         other => Err(tr!("알 수 없는 도구: {}", "Unknown tool: {}", other.unwrap_or(""))),
     };
     tool_result(result)
@@ -365,6 +425,9 @@ fn list_indexes(ctx: &Ctx) -> String {
             }
             if default.as_deref() == Some(index.name.as_str()) {
                 marks.push(t("기본", "default"));
+            }
+            if index.author.is_some() {
+                marks.push(t("에이전트 작성", "agent-made"));
             }
             let marks = if marks.is_empty() { String::new() } else { format!(" [{}]", marks.join(", ")) };
             tr!("- {} — 컨텍스트 {}개{marks}", "- {} — {} contexts{marks}", index.name, index.contexts.len())
@@ -507,6 +570,149 @@ fn update_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, S
     Ok(tr!("고쳤습니다: {} (id: {id})", "Updated: {} (id: {id})", context.title))
 }
 
+fn delete_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, String> {
+    let id = args["id"].as_str().ok_or(t("id 인자가 필요합니다", "The id argument is required"))?;
+    let index = ctx.store.index(index_name).ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
+    if !index.contexts.iter().any(|c| c == id) {
+        return Err(tr!("'{index_name}' 인덱스에 없는 컨텍스트: {id}", "Context not in index '{index_name}': {id}"));
+    }
+    let context = ctx.store.context(id).ok_or_else(|| tr!("컨텍스트 없음: {id}", "No context: {id}"))?;
+    if context.author.is_none() {
+        return Err(t(
+            "사람이 만들거나 고친 컨텍스트는 지울 수 없습니다. 목차에서만 빼려면 update_index의 remove를 쓰거나 사용자에게 알려 주세요",
+            "Contexts a person created or edited can't be deleted. To only take it out of an index, use update_index remove or tell the user",
+        )
+        .into());
+    }
+    ctx.store.delete_context(id).map_err(|err| tr!("지우지 못했습니다: {err}", "Couldn't delete: {err}"))?;
+    if let Source::Path { path } = &context.source
+        && web::is_url(path)
+    {
+        cache::forget_if_unused(ctx.store, path);
+    }
+
+    notify_changed();
+    Ok(tr!("지웠습니다: {} (id: {id})", "Deleted: {} (id: {id})", context.title))
+}
+
+fn create_index(ctx: &Ctx, name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if !store::is_valid_index_name(name) {
+        return Err(t("이름은 영문·숫자·-·_ 만, 64자 이내로 쓸 수 있습니다", "Names can only use letters, numbers, - and _, up to 64").into());
+    }
+    if ctx.store.index(name).is_some() {
+        return Err(tr!("'{name}' 인덱스가 이미 있습니다. use_index로 바꾸세요", "Index '{name}' already exists. Switch to it with use_index"));
+    }
+    let index = store::Index { name: name.to_owned(), contexts: Vec::new(), author: Some(ctx.client()) };
+    ctx.store.save_index(&index).map_err(|err| tr!("만들지 못했습니다: {err}", "Couldn't create it: {err}"))?;
+    if let Some(session) = &ctx.session {
+        ctx.sessions.lock().unwrap().entry(session.clone()).or_default().index = Some(name.to_owned());
+    }
+
+    notify_changed();
+    let mut reply = tr!("'{name}' 인덱스를 만들었고 이 세션은 이제 이 인덱스를 씁니다.", "Created index '{name}'; this session now uses it.");
+    if ctx.store.default_index().as_deref() != Some(name) {
+        reply.push_str(t(
+            " 새 세션은 기본 인덱스를 받으니, 이 인덱스를 기본으로 쓰려면 사용자에게 앱에서 지정해 달라고 하세요.",
+            " New sessions get the default index; ask the user to set this one as default in the app if needed.",
+        ));
+    }
+    Ok(reply)
+}
+
+fn update_index(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let name = text_arg(args, "name").or_else(|| ctx.index()).ok_or(t("고칠 인덱스가 없습니다", "No index to edit"))?;
+    let mut index = ctx.store.index(&name).ok_or_else(|| tr!("인덱스 없음: '{name}'", "No index '{name}'"))?;
+    let ids = |key: &str| -> Vec<String> {
+        args[key].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
+    };
+    let (add, remove) = (ids("add"), ids("remove"));
+    let new_name = text_arg(args, "new_name").filter(|n| *n != name);
+    if add.is_empty() && remove.is_empty() && new_name.is_none() {
+        return Err(t("바꿀 값이 없습니다 (add, remove, new_name 중 하나 이상)", "Nothing to change (pass add, remove, or new_name)").into());
+    }
+
+    // 모두 확인한 뒤에 한꺼번에 바꾼다
+    for id in &add {
+        if ctx.store.context(id).is_none() {
+            return Err(tr!("컨텍스트 없음: {id}", "No context: {id}"));
+        }
+    }
+    for id in &remove {
+        if !index.contexts.contains(id) {
+            return Err(tr!("'{name}' 인덱스에 없는 컨텍스트: {id}", "Context not in index '{name}': {id}"));
+        }
+        let agent_context = ctx.store.context(id).is_some_and(|c| c.author.is_some());
+        if index.author.is_none() && !agent_context {
+            return Err(tr!(
+                "사람이 만든 인덱스에서 사람이 만든 컨텍스트는 뺄 수 없습니다: {id}. 사용자에게 알려 주세요",
+                "Can't take a person-made context out of a person-made index: {id}. Tell the user",
+            ));
+        }
+    }
+    if let Some(new_name) = &new_name {
+        if index.author.is_none() {
+            return Err(t(
+                "사람이 만들거나 고친 인덱스는 이름을 바꿀 수 없습니다. 사용자에게 알려 주세요",
+                "Indexes a person created or edited can't be renamed. Tell the user",
+            )
+            .into());
+        }
+        if !store::is_valid_index_name(new_name) {
+            return Err(t("이름은 영문·숫자·-·_ 만, 64자 이내로 쓸 수 있습니다", "Names can only use letters, numbers, - and _, up to 64").into());
+        }
+        if ctx.store.index(new_name).is_some() {
+            return Err(tr!("'{new_name}' 인덱스가 이미 있습니다", "Index '{new_name}' already exists"));
+        }
+    }
+
+    let before = index.contexts.len();
+    index.contexts.retain(|c| !remove.contains(c));
+    let removed = before - index.contexts.len();
+    let mut added = 0;
+    for id in add {
+        if !index.contexts.contains(&id) {
+            index.contexts.push(id);
+            added += 1;
+        }
+    }
+    let save = |err| tr!("저장하지 못했습니다: {err}", "Couldn't save: {err}");
+    ctx.store.save_index(&index).map_err(save)?;
+    let mut current = name.clone();
+    if let Some(new_name) = new_name {
+        ctx.store.rename_index(&name, &new_name).map_err(save)?;
+        // 옛 이름을 고른 세션은 새 이름을 따라간다
+        for session in ctx.sessions.lock().unwrap().values_mut() {
+            if session.index.as_deref() == Some(name.as_str()) {
+                session.index = Some(new_name.clone());
+            }
+        }
+        current = new_name;
+    }
+
+    notify_changed();
+    let renamed = if current == name { String::new() } else { tr!(", 이름 '{name}' → '{current}'", ", renamed '{name}' → '{current}'") };
+    Ok(tr!(
+        "'{current}' 인덱스를 고쳤습니다: {added}개 넣음, {removed}개 뺌{renamed}",
+        "Updated index '{current}': {added} added, {removed} removed{renamed}"
+    ))
+}
+
+fn delete_index(ctx: &Ctx, name: &str) -> Result<String, String> {
+    let index = ctx.store.index(name).ok_or_else(|| tr!("인덱스 없음: '{name}'", "No index '{name}'"))?;
+    if index.author.is_none() {
+        return Err(t(
+            "사람이 만들거나 고친 인덱스는 지울 수 없습니다. 사용자에게 알려 주세요",
+            "Indexes a person created or edited can't be deleted. Tell the user",
+        )
+        .into());
+    }
+    ctx.store.delete_index(name).map_err(|err| tr!("지우지 못했습니다: {err}", "Couldn't delete: {err}"))?;
+
+    notify_changed();
+    Ok(tr!("'{name}' 인덱스를 지웠습니다. 담겨 있던 컨텍스트 {}개는 남아 있습니다.", "Deleted index '{name}'. Its {} contexts remain.", index.contexts.len()))
+}
+
 fn text_arg(args: &Value, name: &str) -> Option<String> {
     args[name].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
 }
@@ -589,7 +795,7 @@ mod tests {
     fn setup(name: &str) -> (Store, Sessions) {
         let root = std::env::temp_dir().join(format!("octo-mcp-test-{name}-{}", store::new_id()));
         let store = Store::at(root).unwrap();
-        store.save_index(&Index { name: "x".into(), contexts: vec![] }).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec![], author: None }).unwrap();
         (store, Sessions::default())
     }
 
@@ -630,12 +836,83 @@ mod tests {
         let (store, sessions) = setup("dispatch");
         let ctx = ctx(&store, &sessions);
         let names: Vec<_> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
-        assert!(names.contains(&"add_context".into()) && names.contains(&"update_context".into()));
+        for name in ["add_context", "update_context", "delete_context", "create_index", "update_index", "delete_index"] {
+            assert!(names.contains(&name.to_owned()), "{name}");
+        }
 
         let reply = call(&ctx, &json!({ "name": "add_context", "arguments": { "title": "t", "body": "b" } }));
         assert_eq!(reply["isError"], false);
         let toc = call(&ctx, &json!({ "name": "get_index" }));
         assert!(toc["content"][0]["text"].as_str().unwrap().contains("unknown"));
+    }
+
+    fn human_context(store: &Store, id: &str) {
+        let context = Context { id: id.into(), title: id.into(), summary: String::new(), source: Source::Document, author: None };
+        store.save_context(&context).unwrap();
+    }
+
+    #[test]
+    fn delete_context_only_removes_agent_contexts_everywhere() {
+        let (store, sessions) = setup("delete-ctx");
+        let ctx = ctx(&store, &sessions);
+        human_context(&store, "h");
+        store.save_index(&Index { name: "x".into(), contexts: vec!["h".into()], author: None }).unwrap();
+        assert!(delete_context(&ctx, "x", &json!({ "id": "h" })).is_err());
+
+        add_context(&ctx, "x", &json!({ "title": "note", "body": "b" })).unwrap();
+        let id = store.index("x").unwrap().contexts[1].clone();
+        store.save_index(&Index { name: "y".into(), contexts: vec![id.clone()], author: None }).unwrap();
+        delete_context(&ctx, "x", &json!({ "id": id })).unwrap();
+        assert!(store.context(&id).is_none());
+        assert_eq!(store.index("x").unwrap().contexts, vec!["h".to_string()]);
+        assert!(store.index("y").unwrap().contexts.is_empty());
+    }
+
+    #[test]
+    fn create_index_switches_the_session() {
+        let (store, sessions) = setup("create");
+        sessions.lock().unwrap().insert("s".into(), Session::default());
+        let ctx = Ctx { store: &store, sessions: &sessions, session: Some("s".into()), pinned: None };
+        assert!(create_index(&ctx, "통신").is_err());
+        assert!(create_index(&ctx, "x").is_err());
+        create_index(&ctx, "telecom").unwrap();
+        assert!(store.index("telecom").unwrap().author.is_some());
+        assert_eq!(ctx.index().as_deref(), Some("telecom"));
+    }
+
+    #[test]
+    fn update_index_respects_ownership() {
+        let (store, sessions) = setup("update-index");
+        sessions.lock().unwrap().insert("s".into(), Session::default());
+        let ctx = Ctx { store: &store, sessions: &sessions, session: Some("s".into()), pinned: None };
+        human_context(&store, "h");
+        // 사람 인덱스: 넣기는 되고, 사람 컨텍스트 빼기와 이름 바꾸기는 안 된다
+        assert!(update_index(&ctx, &json!({ "name": "x", "add": ["h"] })).is_ok());
+        assert!(update_index(&ctx, &json!({ "name": "x", "add": ["missing"] })).is_err());
+        assert!(update_index(&ctx, &json!({ "name": "x", "remove": ["h"] })).is_err());
+        assert!(update_index(&ctx, &json!({ "name": "x", "new_name": "z" })).is_err());
+        assert!(update_index(&ctx, &json!({ "name": "x" })).is_err());
+
+        // 에이전트 인덱스: 다 된다. 세션은 새 이름을 따라간다
+        create_index(&ctx, "mine").unwrap();
+        update_index(&ctx, &json!({ "add": ["h"] })).unwrap();
+        update_index(&ctx, &json!({ "remove": ["h"], "new_name": "mine2" })).unwrap();
+        assert!(store.index("mine").is_none());
+        assert!(store.index("mine2").unwrap().contexts.is_empty());
+        assert_eq!(ctx.index().as_deref(), Some("mine2"));
+    }
+
+    #[test]
+    fn delete_index_keeps_contexts() {
+        let (store, sessions) = setup("delete-index");
+        let ctx = ctx(&store, &sessions);
+        assert!(delete_index(&ctx, "x").is_err());
+        create_index(&ctx, "tmp").unwrap();
+        human_context(&store, "h");
+        update_index(&ctx, &json!({ "name": "tmp", "add": ["h"] })).unwrap();
+        delete_index(&ctx, "tmp").unwrap();
+        assert!(store.index("tmp").is_none());
+        assert!(store.context("h").is_some());
     }
 
     #[test]
@@ -644,7 +921,7 @@ mod tests {
         let ctx = ctx(&store, &sessions);
         let human = Context { id: "h".into(), title: "h".into(), summary: String::new(), source: Source::Document, author: None };
         store.save_context(&human).unwrap();
-        store.save_index(&Index { name: "x".into(), contexts: vec!["h".into()] }).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec!["h".into()], author: None }).unwrap();
         assert!(update_context(&ctx, "x", &json!({ "id": "h", "body": "x" })).is_err());
 
         add_context(&ctx, "x", &json!({ "title": "note", "body": "v1" })).unwrap();

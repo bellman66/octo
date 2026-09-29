@@ -194,6 +194,12 @@ claude mcp add --transport http --scope user octo http://127.0.0.1:47614/mcp
 | `report_access` | `id`, `method`, `content?`, `version?` | Octo가 가져오지 못한 링크를 에이전트가 어떻게 열었는지, 필요하면 읽은 본문까지 남깁니다. |
 | `add_context` | `title`, `summary?`, `body` 또는 `path` | 다음 세션도 알아야 할 내용을 현재 인덱스에 새 컨텍스트로 남깁니다. 인덱스에 같은 제목이 있으면 거절합니다. |
 | `update_context` | `id`, `title?`, `summary?`, `body?`, `path?` | 에이전트가 만든 컨텍스트를 고칩니다. 사람이 앱에서 한 번 저장하면 더는 에이전트가 바꿀 수 없습니다. |
+| `delete_context` | `id` | 에이전트가 만든 컨텍스트를 지우고 모든 인덱스에서 뺍니다. |
+| `create_index` | `name` | 빈 인덱스를 만들고 세션이 그 인덱스를 쓰게 합니다. |
+| `update_index` | `name?`, `new_name?`, `add?`, `remove?` | 인덱스에 기존 컨텍스트를 넣거나 빼고, 이름을 바꿉니다. 빼기는 인덱스나 컨텍스트가 에이전트 것일 때만, 이름 바꾸기는 에이전트가 만든 인덱스만 됩니다. |
+| `delete_index` | `name` | 에이전트가 만든 인덱스를 지웁니다. 담겨 있던 컨텍스트는 남습니다. |
+
+에이전트는 자기가 만든 것만 이름을 바꾸거나 지울 수 있습니다. 사람이 앱에서 컨텍스트나 인덱스를 고치면 사람 것이 되고, 에이전트는 대신 사용자에게 알리도록 안내받습니다.
 
 에이전트가 `get_index`로 받는 목차는 이런 모양입니다.
 

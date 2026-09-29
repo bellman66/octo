@@ -687,7 +687,7 @@ impl App {
         if self.store.index(&name).is_some() {
             return self.toast(tr!("'{name}' 인덱스가 이미 있어요", "Index '{name}' already exists"));
         }
-        if let Err(err) = self.store.save_index(&Index { name: name.clone(), contexts: Vec::new() }) {
+        if let Err(err) = self.store.save_index(&Index { name: name.clone(), contexts: Vec::new(), author: None }) {
             return self.toast(tr!("만들지 못했어요: {err}", "Couldn't create it: {err}"));
         }
         self.new_index_name.clear();
@@ -717,6 +717,11 @@ impl App {
         if let Err(err) = self.store.rename_index(&old, &new) {
             return self.toast(tr!("이름을 바꾸지 못했어요: {err}", "Couldn't rename it: {err}"));
         }
+        // 사람이 이름을 바꾸면 사람 것이 된다
+        if let Some(mut index) = self.store.index(&new).filter(|i| i.author.is_some()) {
+            index.author = None;
+            let _ = self.store.save_index(&index);
+        }
         self.rename_draft = None;
         self.refresh();
         self.selected_index = Some(new.clone());
@@ -729,6 +734,8 @@ impl App {
             return Task::none();
         };
         f(&mut index);
+        // 사람이 목차를 고치면 사람 것이 된다
+        index.author = None;
         if let Err(err) = self.store.save_index(&index) {
             return self.toast(tr!("저장하지 못했어요: {err}", "Couldn't save: {err}"));
         }

@@ -104,6 +104,10 @@ pub struct Index {
     pub name: String,
     /// 목차 순서 그대로
     pub contexts: Vec<String>,
+    /// MCP로 에이전트가 만든 인덱스면 그 클라이언트 이름. 사람이 앱에서 이름을 바꾸거나
+    /// 목차를 고치면 지워지고, 그때부터는 에이전트가 이름을 바꾸거나 지울 수 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -392,7 +396,7 @@ mod tests {
         let store = temp_store("ctx");
         store.save_context(&doc("a")).unwrap();
         store.save_context(&doc("b")).unwrap();
-        store.save_index(&Index { name: "x".into(), contexts: vec!["a".into(), "b".into()] }).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec!["a".into(), "b".into()], author: None }).unwrap();
 
         assert_eq!(store.indexes_using("a").len(), 1);
         store.delete_context("a").unwrap();
@@ -427,8 +431,8 @@ mod tests {
     #[test]
     fn rename_keeps_contexts_and_default() {
         let store = temp_store("rename");
-        store.save_index(&Index { name: "old".into(), contexts: vec!["c1".into()] }).unwrap();
-        store.save_index(&Index { name: "other".into(), contexts: vec![] }).unwrap();
+        store.save_index(&Index { name: "old".into(), contexts: vec!["c1".into()], author: None }).unwrap();
+        store.save_index(&Index { name: "other".into(), contexts: vec![], author: None }).unwrap();
         store.set_default_index("old").unwrap();
 
         store.rename_index("old", "new").unwrap();
@@ -441,8 +445,8 @@ mod tests {
     fn default_index_falls_back_to_first() {
         let store = temp_store("default");
         assert_eq!(store.default_index(), None);
-        store.save_index(&Index { name: "b".into(), contexts: vec![] }).unwrap();
-        store.save_index(&Index { name: "a".into(), contexts: vec![] }).unwrap();
+        store.save_index(&Index { name: "b".into(), contexts: vec![], author: None }).unwrap();
+        store.save_index(&Index { name: "a".into(), contexts: vec![], author: None }).unwrap();
         assert_eq!(store.default_index().as_deref(), Some("a"));
 
         store.set_default_index("b").unwrap();

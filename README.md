@@ -193,6 +193,12 @@ claude mcp add --transport http --scope user octo http://127.0.0.1:47614/mcp
 | `report_access` | `id`, `method`, `content?`, `version?` | Records how the agent opened a link Octo couldn't fetch, and optionally what it read. |
 | `add_context` | `title`, `summary?`, `body` or `path` | Saves something later sessions should know as a new context in the current index. Rejects a title that already exists in the index. |
 | `update_context` | `id`, `title?`, `summary?`, `body?`, `path?` | Edits a context an agent created. Once a person saves it in the app, agents can no longer change it. |
+| `delete_context` | `id` | Deletes a context an agent created and removes it from every index. |
+| `create_index` | `name` | Creates an empty index and switches the session to it. |
+| `update_index` | `name?`, `new_name?`, `add?`, `remove?` | Adds existing contexts to an index, takes them out, or renames it. Removing needs the index or the context to be agent-made; renaming needs an agent-made index. |
+| `delete_index` | `name` | Deletes an index an agent created. Its contexts remain. |
+
+Agents can only rename or delete what they created. Once a person edits a context or an index in the app, it belongs to the person and agents are told to ask the user instead.
 
 Here is an example of what an agent receives from `get_index`:
 
