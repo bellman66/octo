@@ -194,6 +194,22 @@ pub fn info(store: &Store, url: &str) -> Info {
     Info { result: fresh_result(store, url, now).map(|c| label(&c, now)), method }
 }
 
+/// 이 링크에 대해 에이전트가 보고한 방식. 도메인 것으로 넘어가지 않는다. 내보내기에 쓴다.
+pub fn url_method(store: &Store, url: &str) -> Option<Method> {
+    read_methods(store).by_url.get(url).cloned()
+}
+
+/// 가져온 접근 방식을 이 링크에만 둔다. 이미 있으면 그대로 둔다.
+pub fn import_method(store: &Store, url: &str, method: &Method) -> io::Result<()> {
+    let _guard = LOCK.lock().unwrap();
+    let mut methods = read_methods(store);
+    if methods.by_url.contains_key(url) {
+        return Ok(());
+    }
+    methods.by_url.insert(url.to_owned(), method.clone());
+    write(&methods_path(store), &serde_json::to_vec_pretty(&methods).map_err(io::Error::other)?)
+}
+
 pub fn clear_result(store: &Store, url: &str) {
     FAILURES.lock().unwrap().remove(url);
     let _guard = LOCK.lock().unwrap();

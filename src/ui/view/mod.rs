@@ -15,6 +15,7 @@ mod context_sheet;
 mod contexts;
 mod indexes;
 mod session;
+mod transfer_sheet;
 
 use iced::widget::{column, container, image, opaque, row, space, stack, text};
 use iced::{Bottom, Center, Element, Fill, Padding, window};
@@ -41,6 +42,8 @@ pub fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         let content = match sheet {
             Sheet::Context(editor) => context_sheet::view(app, editor),
             Sheet::Connections(sheet) => connection_sheet::view(app, sheet),
+            Sheet::Export(sheet) => transfer_sheet::export_view(sheet),
+            Sheet::Import(sheet) => transfer_sheet::import_view(sheet),
         };
         layers = layers.push(opaque(container(content).center(Fill).padding(32).style(theme::backdrop)));
     }
@@ -78,6 +81,8 @@ fn header(app: &App) -> Element<'_, Message> {
         space::horizontal(),
         mcp,
         language_picker(),
+        ghost_button(i18n::t("가져오기", "Import"), Message::OpenImport),
+        ghost_button(i18n::t("전체 내보내기", "Export all"), Message::OpenExport(None)),
         ghost_button(i18n::t("연결 관리", "Connections"), Message::OpenConnections),
     ]
     .spacing(12)

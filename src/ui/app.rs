@@ -1,5 +1,6 @@
 //! 화면 상태와 상태 변경. 파일이 SSOT이므로 변경은 곧바로 저장소에 쓰고 다시 읽는다.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use iced::widget::{image, text_editor};
@@ -7,6 +8,7 @@ use iced::{Subscription, Task, window};
 use tray_icon::TrayIcon;
 
 use crate::core::store::{self, Connection, Context, DeleteBlocked, Index, Kind, Source, Store};
+use crate::core::transfer::{self, ExportOptions, Scope};
 use crate::core::{cache, content, graph, secret, web};
 use crate::daemon::claude;
 use crate::daemon::dock;
@@ -93,6 +95,27 @@ pub enum Loadable {
 pub enum Sheet {
     Context(ContextEditor),
     Connections(ConnectionsSheet),
+    Export(ExportSheet),
+    Import(ImportSheet),
+}
+
+pub struct ExportSheet {
+    pub scope: Scope,
+    /// 100MB가 넘는 첨부. 확인 중이면 None
+    pub large: Option<Vec<transfer::Large>>,
+    /// 큰 첨부도 넣을지
+    pub attach_large: bool,
+    /// 전체 내보내기에만 보인다
+    pub include_secrets: bool,
+    pub working: bool,
+}
+
+pub struct ImportSheet {
+    pub path: PathBuf,
+    pub plan: transfer::Plan,
+    pub working: bool,
+    /// 가져온 뒤엔 결과와 되돌리기 스냅샷
+    pub done: Option<transfer::Imported>,
 }
 
 #[derive(Default)]
@@ -206,6 +229,21 @@ pub enum Message {
     DeleteConnection,
     TestConnection,
     ConnectionTested(Result<String, String>),
+
+    // 내보내기·가져오기
+    /// None이면 전체
+    OpenExport(Option<String>),
+    ExportScanned(Vec<transfer::Large>),
+    ExportAttachLargeToggled(bool),
+    ExportSecretsToggled(bool),
+    ChooseExportPath,
+    Exported(Result<transfer::Exported, String>),
+    OpenImport,
+    ImportPreviewed(PathBuf, Result<transfer::Plan, String>),
+    ConfirmImport,
+    Imported(Result<transfer::Imported, String>),
+    UndoImport,
+    Restored(Result<(), String>),
 }
 
 impl App {
@@ -544,6 +582,132 @@ impl App {
                 };
             }
 
+            // ── 내보내기·가져오기 ──
+            Message::OpenExport(index) => {
+                let scope = match index {
+                    Some(name) => Scope::Indexes(vec![name]),
+                    None => Scope::All,
+                };
+                self.sheet = Some(Sheet::Export(ExportSheet {
+                    scope: scope.clone(),
+                    large: None,
+                    attach_large: false,
+                    include_secrets: false,
+                    working: false,
+                }));
+                // 폴더 크기를 재는 동안 창이 멈추지 않게
+                let store = self.store.clone();
+                return Task::perform(async move { transfer::large_attachments(&store, &scope, transfer::LARGE_BYTES) }, Message::ExportScanned);
+            }
+            Message::ExportScanned(large) => {
+                if let Some(Sheet::Export(sheet)) = &mut self.sheet {
+                    sheet.large = Some(large);
+                }
+            }
+            Message::ExportAttachLargeToggled(on) => {
+                if let Some(Sheet::Export(sheet)) = &mut self.sheet {
+                    sheet.attach_large = on;
+                }
+            }
+            Message::ExportSecretsToggled(on) => {
+                if let Some(Sheet::Export(sheet)) = &mut self.sheet {
+                    sheet.include_secrets = on;
+                }
+            }
+            Message::ChooseExportPath => return self.export(),
+            Message::Exported(result) => {
+                return match result {
+                    Ok(exported) => {
+                        self.sheet = None;
+                        let mut message = tr!(
+                            "내보냈어요: {} ({})",
+                            "Exported: {} ({})",
+                            exported.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                            transfer::human_bytes(exported.bytes)
+                        );
+                        let path_only = exported.skipped.len() + exported.missing.len();
+                        if path_only > 0 {
+                            message.push_str(&tr!(" · {path_only}개는 경로만", " · {path_only} path only"));
+                        }
+                        self.toast(message)
+                    }
+                    Err(err) => {
+                        if let Some(Sheet::Export(sheet)) = &mut self.sheet {
+                            sheet.working = false;
+                        }
+                        self.toast(err)
+                    }
+                };
+            }
+            Message::OpenImport => {
+                // 파일 창은 메인 스레드에서 띄워야 한다 (macOS)
+                let Some(path) = rfd::FileDialog::new()
+                    .set_title(i18n::t("가져올 Octo 파일", "Octo file to import"))
+                    .add_filter("Octo", &["zip"])
+                    .pick_file()
+                else {
+                    return Task::none();
+                };
+                let store = self.store.clone();
+                return Task::perform(
+                    {
+                        let path = path.clone();
+                        async move { transfer::preview(&store, &path) }
+                    },
+                    move |plan| Message::ImportPreviewed(path.clone(), plan),
+                );
+            }
+            Message::ImportPreviewed(path, result) => match result {
+                Ok(plan) => self.sheet = Some(Sheet::Import(ImportSheet { path, plan, working: false, done: None })),
+                Err(err) => return self.toast(err),
+            },
+            Message::ConfirmImport => {
+                let Some(Sheet::Import(sheet)) = &mut self.sheet else { return Task::none() };
+                sheet.working = true;
+                let store = self.store.clone();
+                let path = sheet.path.clone();
+                return Task::perform(async move { transfer::import(&store, &path) }, Message::Imported);
+            }
+            Message::Imported(result) => {
+                if let Some(Sheet::Import(sheet)) = &mut self.sheet {
+                    sheet.working = false;
+                }
+                return match result {
+                    Ok(imported) => {
+                        if let Some(Sheet::Import(sheet)) = &mut self.sheet {
+                            sheet.done = Some(imported);
+                        }
+                        self.refresh();
+                        Task::batch([self.toast(i18n::t("가져왔어요", "Imported")), self.load_toc()])
+                    }
+                    Err(err) => self.toast(err),
+                };
+            }
+            Message::UndoImport => {
+                let Some(Sheet::Import(ImportSheet { done: Some(imported), working, .. })) = &mut self.sheet else {
+                    return Task::none();
+                };
+                *working = true;
+                let store = self.store.clone();
+                let snapshot = imported.snapshot.clone();
+                return Task::perform(async move { transfer::restore(&store, &snapshot) }, Message::Restored);
+            }
+            Message::Restored(result) => {
+                return match result {
+                    Ok(()) => {
+                        self.sheet = None;
+                        self.refresh();
+                        Task::batch([self.toast(i18n::t("가져오기 전으로 되돌렸어요", "Restored to before the import")), self.load_toc()])
+                    }
+                    Err(err) => {
+                        if let Some(Sheet::Import(sheet)) = &mut self.sheet {
+                            sheet.working = false;
+                        }
+                        self.toast(err)
+                    }
+                };
+            }
+
             // ── 연결 시트 ──
             Message::OpenConnections => {
                 if let Some(Sheet::Context(editor)) = self.sheet.take() {
@@ -757,6 +921,32 @@ impl App {
             }
             Err(err) => self.toast(tr!("파일을 읽지 못했어요: {err}", "Couldn't read the file: {err}")),
         }
+    }
+
+    fn export(&mut self) -> Task<Message> {
+        let Some(Sheet::Export(sheet)) = &mut self.sheet else { return Task::none() };
+        let name = match &sheet.scope {
+            Scope::All => "octo-all".to_owned(),
+            Scope::Indexes(names) => names.join("+"),
+        };
+        // 파일 창은 메인 스레드에서 띄워야 한다 (macOS)
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(i18n::t("내보낼 위치", "Export to"))
+            .set_file_name(transfer::default_file_name(&name))
+            .add_filter("Octo", &["zip"]);
+        if let Some(dir) = dirs::download_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(dest) = dialog.save_file() else { return Task::none() };
+
+        sheet.working = true;
+        let options = ExportOptions {
+            include_secrets: sheet.include_secrets && sheet.scope == Scope::All,
+            skip_large: !sheet.attach_large,
+            ..ExportOptions::new(sheet.scope.clone())
+        };
+        let store = self.store.clone();
+        Task::perform(async move { transfer::export(&store, &options, &dest) }, Message::Exported)
     }
 
     fn save_context(&mut self) -> Task<Message> {

@@ -1,4 +1,4 @@
-//! ② 인덱스: 모든 인덱스를 접힘 목록으로 보여준다. 누르면 그 자리에서 펼쳐져 이름·기본·삭제와 담긴 순서를 다룬다.
+//! ② 인덱스: 모든 인덱스를 접힘 목록으로 보여준다. 누르면 그 자리에서 펼쳐져 이름·기본·내보내기·삭제와 담긴 순서를 다룬다.
 
 use iced::widget::{button, column, container, row, space, text, text_input};
 use iced::{Center, Element, Fill, Padding};
@@ -137,6 +137,9 @@ fn actions(app: &App, is_default: bool) -> Element<'_, Message> {
     let mut bar = row![ghost_button(t("✎ 이름 바꾸기", "✎ Rename"), Message::StartRenameIndex)].spacing(4).align_y(Center);
     if !is_default {
         bar = bar.push(ghost_button(t("★ 기본으로", "★ Make default"), Message::SetDefaultIndex));
+    }
+    if let Some(name) = &app.selected_index {
+        bar = bar.push(ghost_button(t("⇪ 내보내기", "⇪ Export"), Message::OpenExport(Some(name.clone()))));
     }
     bar = bar.push(space::horizontal());
     bar = if app.confirm_index_delete {

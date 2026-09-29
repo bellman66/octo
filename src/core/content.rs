@@ -13,7 +13,8 @@ use crate::tr;
 
 const SUMMARY_MAX: usize = 80;
 const MAX_TREE_ENTRIES: usize = 2_000;
-const SKIP_DIRS: [&str; 4] = [".git", "target", "node_modules", ".idea"];
+/// 폴더 목차와 내보내기 첨부에서 건너뛰는 폴더
+pub(crate) const SKIP_DIRS: [&str; 4] = [".git", "target", "node_modules", ".idea"];
 
 /// 세션이 받는 본문. 실패 사유는 사용자에게 그대로 보여줄 문장이다.
 pub fn load(store: &Store, context: &Context) -> Result<String, String> {

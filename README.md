@@ -30,6 +30,7 @@
 - [Connecting an agent](#connecting-an-agent)
 - [MCP tools](#mcp-tools)
 - [Link cache](#link-cache)
+- [Import and export](#import-and-export)
 - [Data and configuration](#data-and-configuration)
 - [Security](#security)
 - [Architecture](#architecture)
@@ -198,6 +199,9 @@ claude mcp add --transport http --scope user octo http://127.0.0.1:47614/mcp
 | `update_index` | `name?`, `new_name?`, `add?`, `remove?` | Adds existing contexts to an index, takes them out, or renames it. Removing needs the index or the context to be agent-made; renaming needs an agent-made index. |
 | `delete_index` | `name` | Deletes an index an agent created. Its contexts remain. |
 
+| `export_indexes` | `indexes?`, `all?`, `path?`, `include_secrets?`, `attach_large?` | Exports indexes to a `.octo.zip`. See [Import and export](#import-and-export). |
+| `import_indexes` | `path`, `dry_run?` | Imports a `.octo.zip`. Agents are told to show the `dry_run` summary to the user first. |
+
 Agents can only rename or delete what they created. Once a person edits a context or an index in the app, it belongs to the person and agents are told to ask the user instead.
 
 Here is an example of what an agent receives from `get_index`:
@@ -243,6 +247,24 @@ The link cache stores two things separately, because they differ in how long the
   <img src="docs/images/en-sheet.png" width="720" alt="Editing a link context: the Link cache panel shows a cached result submitted by claude-code with its version, and the reported access method, each with a clear button">
 </p>
 
+## Import and export
+
+Share an index with a teammate, move to another PC, or keep a backup, all as a single `.octo.zip` file.
+
+- **Export** an index from its panel (**⇪ Export**), or everything with **Export all** in the header. Agents can use `export_indexes`.
+- **What goes in:** the indexes, their contexts, document text, graph connections, and the access methods agents reported for links.
+  - Files and folders that path contexts point to are attached, skipping `.git`, `target`, `node_modules`, and `.idea`.
+  - If one context's attachment exceeds 100MB, Octo asks first. Agents get the path only unless they pass `attach_large`.
+  - Links (URLs) carry only the address. Cached link text is left out because it expires after a day.
+  - Paths under your home folder are written as `~/…`, so they resolve on another PC or OS.
+- **Passwords** are left out unless you tick the box in **Export all**. They are then written **as plain text**, so keep that file private.
+- **Import** with **Import** in the header, or `import_indexes`. You see a summary first: new, updated, and unchanged contexts, renamed indexes, and attachment size.
+  - A path uses the original when it exists on this PC. Otherwise it points to the attached copy, extracted to `~/.octo/attachments/<id>/`.
+  - An index whose name already exists is imported under a new name (`name-2`). Your own index is never overwritten.
+  - A context with the same id is left alone when identical and updated when it differs.
+  - Everything imported belongs to you, so agents can't edit or delete it.
+- **Undo.** Before every import Octo saves a snapshot to `~/.octo/backups/` (the latest 5 are kept). **Undo** on the result screen restores it exactly.
+
 ## Data and configuration
 
 All data stays on your machine.
@@ -256,6 +278,8 @@ All data stays on your machine.
 ├─ contexts/<id>.json     Context definitions (doc bodies in <id>.md)
 ├─ indexes/<name>.json    Indexes and their order
 ├─ connections/           neo4j connection settings (passwords excluded)
+├─ attachments/<id>/      Files extracted from imports when the original is missing
+├─ backups/               Snapshots taken before each import (latest 5)
 └─ cache/
    ├─ access.json         Access methods, by URL and by domain
    └─ results/            Fetched link results (removed after 1 day)

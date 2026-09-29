@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::core::store::{self, Context, Source, Store};
+use crate::core::transfer::{self, ExportOptions, Scope};
 use crate::core::{cache, content, web};
 use crate::i18n::t;
 use crate::tr;
@@ -375,6 +376,44 @@ fn tools() -> Value {
                 "required": ["name"],
             },
         },
+        {
+            "name": "export_indexes",
+            "description": t(
+                "인덱스를 zip(.octo.zip)으로 내보낸다. 목차의 컨텍스트와 문서 본문, 경로가 가리키는 파일·폴더까지 담는다. \
+                 indexes와 all을 모두 빼면 이 세션의 인덱스. 첨부가 100MB를 넘는 컨텍스트는 attach_large가 없으면 경로만 담는다.",
+                "Export indexes as a zip (.octo.zip) with their contexts, document text, and the files and folders paths point to. \
+                 Omit both indexes and all for this session's index. Contexts whose attachment exceeds 100MB get only their path unless attach_large is set.",
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "indexes": { "type": "array", "items": { "type": "string" }, "description": t("내보낼 인덱스 이름", "Index names to export") },
+                    "all": { "type": "boolean", "description": t("모든 인덱스와 컨텍스트 (다른 PC 이전·백업용)", "Every index and context (for moving PCs or backups)") },
+                    "path": { "type": "string", "description": t("저장할 경로. 없으면 ~/Downloads/<이름>-<날짜>.octo.zip", "Where to save. Defaults to ~/Downloads/<name>-<date>.octo.zip") },
+                    "include_secrets": { "type": "boolean", "description": t("all일 때만: 그래프 연결 비밀번호를 평문으로 넣는다. 사용자가 명시적으로 원할 때만", "Only with all: put graph connection passwords in as plain text. Only when the user explicitly asks") },
+                    "attach_large": { "type": "boolean", "description": t("100MB 넘는 첨부도 넣는다", "Include attachments over 100MB too") },
+                },
+            },
+        },
+        {
+            "name": "import_indexes",
+            "description": t(
+                "octo 내보내기 파일(.octo.zip)을 가져온다. 먼저 dry_run으로 요약을 사용자에게 보여주고 확인받은 뒤 가져온다. \
+                 가져온 항목은 사람 소유가 되어 에이전트가 고치거나 지울 수 없다. 같은 이름 인덱스는 새 이름으로 만들고, 같은 id 컨텍스트는 내용이 다르면 갱신한다. \
+                 가져오기 직전 상태는 스냅샷으로 남는다.",
+                "Import an octo export file (.octo.zip). Show the dry_run summary to the user and get confirmation first. \
+                 Imported items belong to the person, so agents can't edit or delete them. Same-name indexes get a new name; same-id contexts are updated if they differ. \
+                 The state just before importing is kept as a snapshot.",
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": t(".octo.zip 파일 경로", "Path to the .octo.zip file") },
+                    "dry_run": { "type": "boolean", "description": t("true면 바꿀 내용 요약만 돌려준다", "If true, only return a summary of what would change") },
+                },
+                "required": ["path"],
+            },
+        },
     ])
 }
 
@@ -404,6 +443,8 @@ fn call(ctx: &Ctx, params: &Value) -> Value {
         Some("create_index") => create_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
         Some("update_index") => update_index(ctx, &params["arguments"]),
         Some("delete_index") => delete_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
+        Some("export_indexes") => export_indexes(ctx, &params["arguments"]),
+        Some("import_indexes") => import_indexes(ctx, &params["arguments"]),
         other => Err(tr!("알 수 없는 도구: {}", "Unknown tool: {}", other.unwrap_or(""))),
     };
     tool_result(result)
@@ -713,6 +754,95 @@ fn delete_index(ctx: &Ctx, name: &str) -> Result<String, String> {
     Ok(tr!("'{name}' 인덱스를 지웠습니다. 담겨 있던 컨텍스트 {}개는 남아 있습니다.", "Deleted index '{name}'. Its {} contexts remain.", index.contexts.len()))
 }
 
+fn export_indexes(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let all = args["all"].as_bool().unwrap_or(false);
+    let names: Vec<String> = args["indexes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+    let scope = if all {
+        Scope::All
+    } else if !names.is_empty() {
+        Scope::Indexes(names)
+    } else {
+        Scope::Indexes(vec![ctx.index().ok_or(t("내보낼 인덱스가 없습니다", "No index to export"))?])
+    };
+    let include_secrets = args["include_secrets"].as_bool().unwrap_or(false);
+    if include_secrets && !all {
+        return Err(t("비밀번호는 전체 내보내기(all)에만 넣을 수 있습니다", "Passwords can only go into a full export (all)").into());
+    }
+    let dest = match text_arg(args, "path") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => transfer::default_export_path(match &scope {
+            Scope::All => "octo-all",
+            Scope::Indexes(names) if names.len() == 1 => &names[0],
+            Scope::Indexes(_) => "octo-indexes",
+        }),
+    };
+    let options = ExportOptions { include_secrets, skip_large: !args["attach_large"].as_bool().unwrap_or(false), ..ExportOptions::new(scope) };
+    let exported = transfer::export(ctx.store, &options, &dest)?;
+
+    let mut reply = tr!(
+        "내보냈습니다: {} ({})\n인덱스 {}개 · 컨텍스트 {}개 · 첨부 {}개",
+        "Exported: {} ({})\n{} indexes · {} contexts · {} attachments",
+        exported.path.display(),
+        transfer::human_bytes(exported.bytes),
+        exported.indexes,
+        exported.contexts,
+        exported.attached
+    );
+    if !exported.skipped.is_empty() {
+        reply.push_str(&tr!("\n100MB가 넘어 경로만 담음: {}", "\nOver 100MB, path only: {}", exported.skipped.join(", ")));
+    }
+    if !exported.missing.is_empty() {
+        reply.push_str(&tr!("\n원본이 없어 경로만 담음: {}", "\nSource missing, path only: {}", exported.missing.join(", ")));
+    }
+    if exported.secrets > 0 {
+        reply.push_str(&tr!(
+            "\n⚠ 비밀번호 {}개가 평문으로 들어 있습니다. 파일을 안전하게 다루도록 사용자에게 알리세요.",
+            "\n⚠ Contains {} passwords in plain text. Tell the user to handle the file carefully.",
+            exported.secrets
+        ));
+    }
+    Ok(reply)
+}
+
+fn import_indexes(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let path = text_arg(args, "path").ok_or(t("path 인자가 필요합니다", "The path argument is required"))?;
+    let path = std::path::Path::new(&path);
+    if args["dry_run"].as_bool().unwrap_or(false) {
+        let plan = transfer::preview(ctx.store, path)?;
+        return Ok(tr!("가져오면 이렇게 바뀝니다 (아직 바뀐 것 없음)\n{}", "Importing would change this (nothing changed yet)\n{}", plan_text(&plan)));
+    }
+    let imported = transfer::import(ctx.store, path)?;
+    notify_changed();
+    Ok(tr!(
+        "가져왔습니다. 가져온 항목은 사람 소유입니다.\n{}\n되돌리기용 스냅샷: {}",
+        "Imported. Imported items belong to the person.\n{}\nSnapshot for undo: {}",
+        plan_text(&imported.plan),
+        imported.snapshot.display()
+    ))
+}
+
+fn plan_text(plan: &transfer::Plan) -> String {
+    let indexes = plan
+        .indexes
+        .iter()
+        .map(|(from, to)| if from == to { from.clone() } else { format!("{from} → {to}") })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut text = tr!(
+        "인덱스: {indexes}\n컨텍스트: 새로 {} · 갱신 {} · 그대로 {}\n연결 {}개 · 풀 첨부 {}",
+        "Indexes: {indexes}\nContexts: {} new · {} updated · {} unchanged\n{} connections · {} of attachments to extract",
+        plan.new,
+        plan.updated,
+        plan.unchanged,
+        plan.connections,
+        transfer::human_bytes(plan.attach_bytes)
+    );
+    if plan.secrets {
+        text.push_str(t("\n비밀번호 포함", "\nIncludes passwords"));
+    }
+    text
+}
+
 fn text_arg(args: &Value, name: &str) -> Option<String> {
     args[name].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
 }
@@ -836,7 +966,7 @@ mod tests {
         let (store, sessions) = setup("dispatch");
         let ctx = ctx(&store, &sessions);
         let names: Vec<_> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
-        for name in ["add_context", "update_context", "delete_context", "create_index", "update_index", "delete_index"] {
+        for name in ["add_context", "update_context", "delete_context", "create_index", "update_index", "delete_index", "export_indexes", "import_indexes"] {
             assert!(names.contains(&name.to_owned()), "{name}");
         }
 
@@ -913,6 +1043,27 @@ mod tests {
         delete_index(&ctx, "tmp").unwrap();
         assert!(store.index("tmp").is_none());
         assert!(store.context("h").is_some());
+    }
+
+    #[test]
+    fn export_then_import_through_tools() {
+        let (store, sessions) = setup("transfer");
+        let ctx = ctx(&store, &sessions);
+        add_context(&ctx, "x", &json!({ "title": "note", "body": "b" })).unwrap();
+        let zip = store.root().join("x.octo.zip");
+        let path = zip.to_string_lossy();
+        assert!(export_indexes(&ctx, &json!({ "include_secrets": true })).is_err());
+        export_indexes(&ctx, &json!({ "path": path })).unwrap();
+
+        let (other, other_sessions) = setup("transfer-other");
+        let other_ctx = self::ctx(&other, &other_sessions);
+        let dry = import_indexes(&other_ctx, &json!({ "path": path, "dry_run": true })).unwrap();
+        assert!(dry.contains("x → x-2"), "{dry}");
+        assert!(other.contexts().is_empty());
+        import_indexes(&other_ctx, &json!({ "path": path })).unwrap();
+        let id = other.index("x-2").unwrap().contexts[0].clone();
+        // 가져온 건 사람 것이라 에이전트가 못 지운다
+        assert!(delete_context(&other_ctx, "x-2", &json!({ "id": id })).is_err());
     }
 
     #[test]
