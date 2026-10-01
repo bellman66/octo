@@ -13,16 +13,20 @@
       <stop offset="0" stop-color="#FF8A4C"/>
       <stop offset="1" stop-color="#EE6431"/>
     </linearGradient>
+    <linearGradient id="hat" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4A3F73"/>
+      <stop offset="0.55" stop-color="#2E2750"/>
+      <stop offset="1" stop-color="#231D3F"/>
+    </linearGradient>
   </defs>
 
   <rect width="256" height="256" rx="58" fill="url(#bg)"/>
 
+  <g transform="translate(18 34) scale(0.86)">
   <g transform="rotate(-9 128 132)">
   <g stroke-linecap="round" stroke-linejoin="round" fill="none">
     <!-- 뒤쪽 다리 (조금 어둡게) -->
     <g stroke="#D9542A">
-      <path d="M92 150 C66 150 44 136 36 116" stroke-width="20"/>
-      <path d="M36 116 C30 100 40 88 52 94" stroke-width="12"/>
       <path d="M164 150 C194 154 214 166 220 186" stroke-width="20"/>
       <path d="M220 186 C224 202 208 208 204 196" stroke-width="12"/>
     </g>
@@ -45,12 +49,20 @@
 
   <!-- 말린 다리 끝 흡반 -->
   <g fill="#FFE1CC">
-    <circle cx="44" cy="102" r="2.6"/><circle cx="36" cy="112" r="3"/>
     <circle cx="220" cy="190" r="3"/><circle cx="213" cy="200" r="2.6"/>
     <circle cx="52" cy="216" r="3"/><circle cx="60" cy="223" r="2.6"/><circle cx="50" cy="205" r="3.2"/>
     <circle cx="104" cy="226" r="3"/><circle cx="113" cy="229" r="2.6"/><circle cx="100" cy="216" r="3.2"/>
     <circle cx="166" cy="224" r="3"/><circle cx="158" cy="228" r="2.6"/><circle cx="170" cy="213" r="3.2"/>
     <circle cx="204" cy="216" r="3"/><circle cx="196" cy="223" r="2.6"/><circle cx="206" cy="205" r="3.2"/>
+  </g>
+
+  <!-- 오른팔: 머리 옆으로 올라가 모자 챙을 잡는다 (머리 뒤로 지나간다) -->
+  <g stroke="url(#arm)" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M92 150 C62 148 40 124 42 96" stroke-width="20"/>
+    <path d="M42 96 C44 70 58 50 80 38" stroke-width="14"/>
+  </g>
+  <g fill="#FFE1CC">
+    <circle cx="46" cy="88" r="2.6"/><circle cx="50" cy="72" r="2.3"/>
   </g>
 
   <!-- 머리 -->
@@ -76,6 +88,27 @@
     <ellipse cx="84" cy="140" rx="11" ry="6.5" fill="#FF5E6C" opacity="0.5"/>
     <ellipse cx="172" cy="140" rx="11" ry="6.5" fill="#FF5E6C" opacity="0.5"/>
     <path d="M120 140 Q128 148 136 140" stroke="#2A1A16" stroke-width="4" stroke-linecap="round" fill="none"/>
+  </g>
+
+  <!-- 작은 마술 모자: 머리 위에 살짝 기울여 얹는다 -->
+  <g transform="translate(118 30) rotate(-14)">
+    <ellipse cx="0" cy="0" rx="31" ry="7.5" fill="#231D3F"/>
+    <path d="M-17 -1 L-19 -38 Q0 -43 19 -38 L17 -1 Z" fill="url(#hat)"/>
+    <ellipse cx="0" cy="-38" rx="19" ry="4.5" fill="#4A3F73"/>
+    <path d="M-17.6 -12 L17.6 -12 L17.2 -4 L-17.2 -4 Z" fill="#FF5E8A"/>
+    <path d="M-13 -34 L-12 -16" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" opacity="0.25"/>
+    <ellipse cx="0" cy="-1.5" rx="31" ry="7.5" fill="none" stroke="#4A3F73" stroke-width="1.5" opacity="0.8"/>
+  </g>
+
+  <!-- 모자 챙을 감싼 팔 끝 -->
+  <g stroke="url(#arm)" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M80 38 C88 33 96 34 96 40 C96 45 90 46 87 43" stroke-width="10"/>
+  </g>
+  <circle cx="92" cy="42" r="2" fill="#FFE1CC"/>
+
+  <!-- 반짝 -->
+  <path d="M158 6 L160.5 13.5 L168 16 L160.5 18.5 L158 26 L155.5 18.5 L148 16 L155.5 13.5 Z" fill="#FFD66B"/>
+  <circle cx="176" cy="30" r="2.4" fill="#FFD66B" opacity="0.8"/>
   </g>
   </g>
 </svg>
