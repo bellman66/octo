@@ -95,11 +95,14 @@ pub fn toc(store: &Store, index_name: &str) -> Result<String, String> {
         .index(index_name)
         .ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
 
-    let mut out = tr!(
-        "# 컨텍스트 인덱스: {}\n\n아래는 목차입니다. 필요한 항목만 `load_context`에 id를 넘겨 본문을 가져오세요.\n\n",
-        "# Context index: {}\n\nTable of contents below. Pass an id to `load_context` to get only the items you need.\n\n",
-        index.name
-    );
+    let mut out = tr!("# 컨텍스트 인덱스: {}\n\n", "# Context index: {}\n\n", index.name);
+    if !index.description.trim().is_empty() {
+        out.push_str(&format!("{}\n\n", index.description.trim()));
+    }
+    out.push_str(t(
+        "아래는 목차입니다. 필요한 항목만 `load_context`에 id를 넘겨 본문을 가져오세요.\n\n",
+        "Table of contents below. Pass an id to `load_context` to get only the items you need.\n\n",
+    ));
     let contexts: Vec<Context> = index.contexts.iter().filter_map(|id| store.context(id)).collect();
     if contexts.is_empty() {
         out.push_str(t("(비어 있음)\n", "(empty)\n"));
@@ -129,16 +132,19 @@ pub fn toc(store: &Store, index_name: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// `load_context`: 이 인덱스에 속한 컨텍스트만 열어준다.
-pub fn load_in_index(store: &Store, index_name: &str, id: &str) -> Result<String, String> {
-    let index = store
-        .index(index_name)
-        .ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
-    if !index.contexts.iter().any(|c| c == id) {
-        return Err(tr!("'{index_name}' 인덱스에 없는 컨텍스트: {id}", "Context not in index '{index_name}': {id}"));
-    }
-    let context = store.context(id).ok_or_else(|| tr!("컨텍스트 없음: {id}", "No context: {id}"))?;
+/// `load_context`: 어느 인덱스에든 담긴 컨텍스트만 열어준다. 어디에도 안 담긴 건 사람이 고른 게 아니다.
+pub fn load_listed(store: &Store, id: &str) -> Result<String, String> {
+    let context = listed(store, id)?;
     load(store, &context)
+}
+
+/// 어느 인덱스에든 담긴 컨텍스트
+pub fn listed(store: &Store, id: &str) -> Result<Context, String> {
+    let context = store.context(id).ok_or_else(|| tr!("컨텍스트 없음: {id}", "No context: {id}"))?;
+    if store.indexes_using(id).is_empty() {
+        return Err(tr!("어느 인덱스에도 담기지 않은 컨텍스트: {id}", "Context isn't in any index: {id}"));
+    }
+    Ok(context)
 }
 
 fn load_path(path: &Path) -> Result<String, String> {

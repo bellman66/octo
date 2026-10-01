@@ -1,4 +1,4 @@
-//! ③ 세션 연결: MCP를 한 번만 연결하면, 세션은 기본 인덱스를 받는다.
+//! ③ 세션 연결: MCP를 한 번만 연결하면, 세션은 메시지마다 맞는 인덱스를 골라 연다. 아래에는 펼친 인덱스를 세션이 열었을 때의 목차.
 
 use iced::widget::{button, column, container, row, space, text};
 use iced::{Center, Element, Fill, Padding};
@@ -12,15 +12,15 @@ use crate::ui::widgets::{
 };
 
 const HELP_KO: [&str; 4] = [
-    "한 번만 연결하면 모든 AI 세션이 기본 인덱스를 받아요.",
-    "· 세션에서 “frontend 인덱스로 바꿔줘”라고 하면 그 세션만 바뀌어요",
+    "한 번만 연결하면 AI 세션이 메시지마다 맞는 인덱스를 골라 열어요.",
+    "· 한 세션에서도 주제가 바뀌면 다른 인덱스를 열고, 여러 개를 함께 보기도 해요",
     "· 세션은 get_index로 목차를, load_context로 필요한 본문을 가져가요",
     "· 창을 닫아도 트레이에서 계속 동작해요",
 ];
 
 const HELP_EN: [&str; 4] = [
-    "Connect once and every AI session gets the default index.",
-    "· Say “switch to the frontend index” in a session to change just that session",
+    "Connect once and AI sessions open the index that fits each message.",
+    "· Within one session they open other indexes as the topic changes, or several at once",
     "· Sessions read the table of contents with get_index and fetch what they need with load_context",
     "· Keeps running in the tray after you close the window",
 ];
@@ -36,8 +36,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     body = body.push(claude_card(app)).push(other_tools(app));
 
-    body = match &app.default_index {
-        None => body.push(empty_state(i18n::t("인덱스를 만들면 여기로 연결돼요", "Create an index and it connects here"), "")),
+    body = match &app.selected_index {
+        None => body.push(empty_state(
+            i18n::t("인덱스를 펼치면 세션이 보는 목차가 여기 보여요", "Open an index to see the table of contents sessions get"),
+            "",
+        )),
         Some(name) => {
             let toc: Element<'_, Message> = match &app.toc {
                 Loadable::Loading => caption(i18n::t("불러오는 중…", "Loading…")),
@@ -46,9 +49,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
             };
             body.push(
                 row![
-                    heading(i18n::t("세션이 받는 인덱스", "Index sessions get")),
+                    heading(i18n::t("세션이 보는 목차", "What sessions see")),
                     space::horizontal(),
-                    container(text(format!("★ {name}")).size(13).font(BOLD).color(theme::BLUE))
+                    container(text(name.as_str()).size(13).font(BOLD).color(theme::BLUE))
                         .padding(Padding::from([4, 10]))
                         .style(theme::tinted(theme::BLUE_LIGHT, 999.0)),
                 ]

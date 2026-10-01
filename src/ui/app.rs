@@ -42,9 +42,10 @@ pub struct App {
     pub(super) confirm_index_delete: bool,
     /// 이름 바꾸는 중이면 입력 중인 새 이름
     pub(super) rename_draft: Option<String>,
+    /// 펼친 인덱스의 한 줄 설명을 고치는 중이면 그 값
+    pub(super) description_draft: Option<String>,
     pub(super) toc: Loadable,
     /// 세션이 처음 받는 인덱스
-    pub(super) default_index: Option<String>,
     pub(super) claude: ClaudeState,
 
     pub(super) connections: Vec<Connection>,
@@ -181,7 +182,6 @@ pub enum Message {
     MoveInIndex(usize, i32),
     CopyMcpUrl,
     CopyMcpConfig,
-    SetDefaultIndex,
     ClaudeChecked(claude::Status),
     ConnectClaude,
     DisconnectClaude,
@@ -194,6 +194,10 @@ pub enum Message {
     RenameDraftChanged(String),
     ConfirmRenameIndex,
     CancelRenameIndex,
+    StartDescribeIndex,
+    DescriptionDraftChanged(String),
+    ConfirmDescribeIndex,
+    CancelDescribeIndex,
 
     // 컨텍스트 시트
     KindSelected(Kind),
@@ -266,7 +270,7 @@ impl App {
             confirm_index_delete: false,
             rename_draft: None,
             toc: Loadable::Loading,
-            default_index: None,
+            description_draft: None,
             claude: ClaudeState::Checking,
             connections: Vec::new(),
             sheet: None,
@@ -276,7 +280,6 @@ impl App {
         };
         app.refresh();
         app.selected_index = app.indexes.first().map(|i| i.name.clone());
-        app.selected_index = app.default_index.clone();
         let toc = app.load_toc();
         let check = Task::perform(async { claude::status() }, Message::ClaudeChecked);
         (app, Task::batch([open_window(), toc, check]))
@@ -321,7 +324,6 @@ impl App {
             .collect();
         self.indexes = self.store.indexes();
         self.connections = self.store.connections();
-        self.default_index = self.store.default_index();
         if self.selected_index().is_none() {
             self.selected_index = None;
         }
@@ -409,6 +411,7 @@ impl App {
                 self.selected_index = (self.selected_index.as_deref() != Some(name.as_str())).then_some(name);
                 self.confirm_index_delete = false;
                 self.rename_draft = None;
+                self.description_draft = None;
                 return self.load_toc();
             }
             Message::StartCreateIndex => {
@@ -445,16 +448,6 @@ impl App {
                 let copy = iced::clipboard::write(mcp::config_snippet(self.mcp_port));
                 return Task::batch([copy, self.toast(i18n::t("설정을 복사했어요", "Config copied"))]);
             }
-            Message::SetDefaultIndex => {
-                if let Some(name) = self.selected_index.clone() {
-                    let toast = match self.store.set_default_index(&name) {
-                        Ok(()) => self.toast(tr!("이제 세션은 '{name}'을 먼저 받아요", "Sessions now get '{name}' first")),
-                        Err(err) => self.toast(tr!("바꾸지 못했어요: {err}", "Couldn't change it: {err}")),
-                    };
-                    self.refresh();
-                    return Task::batch([toast, self.load_toc()]);
-                }
-            }
             Message::ClaudeChecked(status) => {
                 self.claude = match status {
                     claude::Status::Connected => ClaudeState::Connected,
@@ -481,17 +474,29 @@ impl App {
                 return Task::batch([toast, check]);
             }
             Message::TocLoaded(name, result) => {
-                if self.default_index.as_deref() == Some(name.as_str()) {
+                if self.selected_index.as_deref() == Some(name.as_str()) {
                     self.toc = result.into();
                 }
             }
             Message::StartRenameIndex => {
                 self.confirm_index_delete = false;
+                self.description_draft = None;
                 self.rename_draft = self.selected_index.clone();
             }
             Message::RenameDraftChanged(value) => self.rename_draft = Some(value),
             Message::ConfirmRenameIndex => return self.rename_index(),
             Message::CancelRenameIndex => self.rename_draft = None,
+            Message::StartDescribeIndex => {
+                self.confirm_index_delete = false;
+                self.rename_draft = None;
+                self.description_draft = Some(self.selected_index().map(|i| i.description.clone()).unwrap_or_default());
+            }
+            Message::DescriptionDraftChanged(value) => self.description_draft = Some(value),
+            Message::ConfirmDescribeIndex => {
+                let Some(draft) = self.description_draft.take() else { return Task::none() };
+                return self.change_index(|index| index.description = draft.trim().to_owned());
+            }
+            Message::CancelDescribeIndex => self.description_draft = None,
             Message::AskDeleteIndex => self.confirm_index_delete = true,
             Message::CancelDeleteIndex => self.confirm_index_delete = false,
             Message::ConfirmDeleteIndex => {
@@ -831,8 +836,8 @@ impl App {
     }
 
     fn load_toc(&mut self) -> Task<Message> {
-        // 오른쪽 목차는 세션이 실제로 받는 기본 인덱스
-        let Some(name) = self.store.default_index() else {
+        // 오른쪽 목차는 펼친 인덱스를 세션이 get_index로 열었을 때 보는 모습
+        let Some(name) = self.selected_index.clone() else {
             return Task::none();
         };
         self.toc = Loadable::Loading;
@@ -851,7 +856,7 @@ impl App {
         if self.store.index(&name).is_some() {
             return self.toast(tr!("'{name}' 인덱스가 이미 있어요", "Index '{name}' already exists"));
         }
-        if let Err(err) = self.store.save_index(&Index { name: name.clone(), contexts: Vec::new(), author: None }) {
+        if let Err(err) = self.store.save_index(&Index { name: name.clone(), contexts: Vec::new(), author: None, description: String::new() }) {
             return self.toast(tr!("만들지 못했어요: {err}", "Couldn't create it: {err}"));
         }
         self.new_index_name.clear();

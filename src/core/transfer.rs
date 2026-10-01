@@ -483,7 +483,7 @@ fn apply(store: &Store, archive: &mut ZipArchive<File>, manifest: &Manifest, wri
         plan.indexes.push((index.name.clone(), name.clone()));
         if write {
             let contexts = index.contexts.iter().filter(|id| manifest.contexts.iter().any(|e| &e.context.id == *id)).cloned().collect();
-            store.save_index(&Index { name, contexts, author: None }).map_err(fail)?;
+            store.save_index(&Index { name, contexts, author: None, description: index.description.clone() }).map_err(fail)?;
         }
     }
     Ok(plan)
@@ -707,7 +707,7 @@ mod tests {
         path_ctx(&from, "f", &file);
         path_ctx(&from, "s", &folder);
         doc(&from, "outside", "not exported", None);
-        from.save_index(&Index { name: "mydata".into(), contexts: vec!["d".into(), "f".into(), "s".into()], author: Some("claude-code".into()) }).unwrap();
+        from.save_index(&Index { name: "mydata".into(), contexts: vec!["d".into(), "f".into(), "s".into()], author: Some("claude-code".into()), description: String::new() }).unwrap();
 
         let zip = work.join("out.octo.zip");
         let exported = export(&from, &ExportOptions::new(Scope::Indexes(vec!["mydata".into()])), &zip).unwrap();
@@ -747,7 +747,7 @@ mod tests {
         let store = Store::at(temp("idem-store")).unwrap();
         path_ctx(&store, "f", &file);
         doc(&store, "d", "v1", None);
-        store.save_index(&Index { name: "x".into(), contexts: vec!["f".into(), "d".into()], author: None }).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec!["f".into(), "d".into()], author: None, description: String::new() }).unwrap();
         let zip = work.join("x.octo.zip");
         export(&store, &ExportOptions::new(Scope::Indexes(vec!["x".into()])), &zip).unwrap();
 
@@ -773,7 +773,7 @@ mod tests {
         fs::write(&file, vec![0u8; 2048]).unwrap();
         let store = Store::at(temp("large-store")).unwrap();
         path_ctx(&store, "big", &file);
-        store.save_index(&Index { name: "x".into(), contexts: vec!["big".into()], author: None }).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec!["big".into()], author: None, description: String::new() }).unwrap();
         let scope = Scope::Indexes(vec!["x".into()]);
         assert_eq!(large_attachments(&store, &scope, 1024).len(), 1);
 
@@ -799,7 +799,7 @@ mod tests {
             author: None,
         };
         store.save_context(&graph).unwrap();
-        store.save_index(&Index { name: "x".into(), contexts: vec!["g".into()], author: None }).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec!["g".into()], author: None, description: String::new() }).unwrap();
 
         let shared = ExportOptions { include_secrets: true, ..ExportOptions::new(Scope::Indexes(vec!["x".into()])) };
         assert_eq!(export(&store, &shared, &work.join("s.octo.zip")).unwrap().secrets, 0);
@@ -814,12 +814,12 @@ mod tests {
         let work = temp("restore");
         let store = Store::at(temp("restore-store")).unwrap();
         doc(&store, "a", "before", Some("claude-code"));
-        store.save_index(&Index { name: "x".into(), contexts: vec!["a".into()], author: None }).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec!["a".into()], author: None, description: String::new() }).unwrap();
 
         let other = Store::at(temp("restore-other")).unwrap();
         doc(&other, "a", "after", None);
         doc(&other, "b", "new", None);
-        other.save_index(&Index { name: "x".into(), contexts: vec!["a".into(), "b".into()], author: None }).unwrap();
+        other.save_index(&Index { name: "x".into(), contexts: vec!["a".into(), "b".into()], author: None, description: String::new() }).unwrap();
         let incoming = work.join("in.octo.zip");
         export(&other, &ExportOptions::new(Scope::All), &incoming).unwrap();
 

@@ -9,6 +9,7 @@
 //!   connections/<id>.json
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,20 +22,42 @@ use crate::i18n::{Lang, t};
 use crate::tr;
 
 pub const DEFAULT_MCP_PORT: u16 = 47_614;
+/// 폴더마다 기억하는 최근 인덱스 수
+pub const FOLDER_HINTS: usize = 3;
+
+/// 폴더마다 인덱스 하나만 기억하던 예전 형식도 읽는다
+fn folders_compat<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Names {
+        One(String),
+        Many(Vec<String>),
+    }
+    let raw = BTreeMap::<String, Names>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(folder, names)| match names {
+            Names::One(name) => (folder, vec![name]),
+            Names::Many(names) => (folder, names),
+        })
+        .collect())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub mcp_port: u16,
-    /// MCP를 한 번 연결한 세션이 처음 받는 인덱스
-    #[serde(default)]
-    pub default_index: Option<String>,
+    // 예전 `default_index`(기본 인덱스)는 없앴다. 남아 있어도 읽을 때 무시하고 다음 저장 때 빠진다.
     #[serde(default)]
     pub language: Lang,
+    /// 작업 폴더(절대 경로) → 그 폴더의 세션이 최근 연 인덱스(최근 것부터, `FOLDER_HINTS`개).
+    /// 세션을 묶지 않고, 에이전트에게 보여주는 인덱스 목록을 이 순서로 앞에 둔다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "folders_compat")]
+    pub folders: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { mcp_port: DEFAULT_MCP_PORT, default_index: None, language: Lang::default() }
+        Self { mcp_port: DEFAULT_MCP_PORT, language: Lang::default(), folders: BTreeMap::new() }
     }
 }
 
@@ -99,9 +122,12 @@ pub struct Context {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Index {
     pub name: String,
+    /// 한 줄 설명. 에이전트가 메시지 주제에 맞는 인덱스를 고르는 근거가 된다.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     /// 목차 순서 그대로
     pub contexts: Vec<String>,
     /// MCP로 에이전트가 만든 인덱스면 그 클라이언트 이름. 사람이 앱에서 이름을 바꾸거나
@@ -172,23 +198,41 @@ impl Store {
         write_json(&self.root.join("config.json"), config)
     }
 
-    /// 기본 인덱스. 지정한 것이 없거나 지워졌으면 이름순 첫 인덱스.
-    pub fn default_index(&self) -> Option<String> {
-        self.config()
-            .default_index
-            .filter(|name| self.index(name).is_some())
-            .or_else(|| self.indexes().first().map(|i| i.name.clone()))
+    /// 작업 폴더들에서 최근 연 인덱스. 가까운 폴더(자신, 그다음 상위) 것부터, 최근 것부터.
+    /// 지워진 인덱스는 빼고, 겹치면 한 번만.
+    pub fn folder_hints(&self, folders: &[String]) -> Vec<String> {
+        let mut mapped: Vec<(String, Vec<String>)> = self
+            .config()
+            .folders
+            .into_iter()
+            .filter(|(mapped, _)| folders.iter().any(|folder| is_within(folder, mapped)))
+            .collect();
+        mapped.sort_by_key(|(folder, _)| std::cmp::Reverse(folder.len()));
+        let mut hints: Vec<String> = Vec::new();
+        for name in mapped.into_iter().flat_map(|(_, names)| names) {
+            if !hints.contains(&name) && self.index(&name).is_some() {
+                hints.push(name);
+            }
+        }
+        hints
+    }
+
+    /// 이 폴더에서 인덱스를 열었다고 기억한다. 맨 앞에 두고 `FOLDER_HINTS`개만 남긴다.
+    pub fn remember_folder_index(&self, folder: &str, name: &str) -> io::Result<()> {
+        let mut config = self.config();
+        let names = config.folders.entry(folder.trim_end_matches('/').to_owned()).or_default();
+        if names.first().map(String::as_str) == Some(name) {
+            return Ok(());
+        }
+        names.retain(|n| n != name);
+        names.insert(0, name.to_owned());
+        names.truncate(FOLDER_HINTS);
+        self.save_config(&config)
     }
 
     pub fn set_language(&self, language: Lang) -> io::Result<()> {
         let mut config = self.config();
         config.language = language;
-        self.save_config(&config)
-    }
-
-    pub fn set_default_index(&self, name: &str) -> io::Result<()> {
-        let mut config = self.config();
-        config.default_index = Some(name.to_owned());
         self.save_config(&config)
     }
 
@@ -264,7 +308,7 @@ impl Store {
         remove_if_exists(&self.index_path(name))
     }
 
-    /// 새 이름으로 쓴 뒤 옛 파일을 지운다. 기본 인덱스였으면 기본 지정도 따라간다.
+    /// 새 이름으로 쓴 뒤 옛 파일을 지운다. 폴더 기억도 따라간다.
     pub fn rename_index(&self, old: &str, new: &str) -> io::Result<()> {
         let mut index = self
             .index(old)
@@ -272,8 +316,12 @@ impl Store {
         index.name = new.to_owned();
         self.save_index(&index)?;
         let mut config = self.config();
-        if config.default_index.as_deref() == Some(old) {
-            config.default_index = Some(new.to_owned());
+        let mut changed = false;
+        for name in config.folders.values_mut().flatten().filter(|name| *name == old) {
+            *name = new.to_owned();
+            changed = true;
+        }
+        if changed {
             self.save_config(&config)?;
         }
         self.delete_index(old)
@@ -332,6 +380,12 @@ pub fn is_valid_index_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `folder`가 `parent` 자신이거나 그 아래에 있는지. 경로 조각 단위로 비교한다 (`/a/bc`는 `/a/b` 아래가 아니다).
+fn is_within(folder: &str, parent: &str) -> bool {
+    let (folder, parent) = (folder.trim_end_matches('/'), parent.trim_end_matches('/'));
+    folder == parent || folder.strip_prefix(parent).is_some_and(|rest| rest.starts_with('/'))
 }
 
 pub fn new_id() -> String {
@@ -396,7 +450,7 @@ mod tests {
         let store = temp_store("ctx");
         store.save_context(&doc("a")).unwrap();
         store.save_context(&doc("b")).unwrap();
-        store.save_index(&Index { name: "x".into(), contexts: vec!["a".into(), "b".into()], author: None }).unwrap();
+        store.save_index(&Index { name: "x".into(), contexts: vec!["a".into(), "b".into()], author: None, description: String::new() }).unwrap();
 
         assert_eq!(store.indexes_using("a").len(), 1);
         store.delete_context("a").unwrap();
@@ -429,31 +483,59 @@ mod tests {
     }
 
     #[test]
-    fn rename_keeps_contexts_and_default() {
+    fn rename_keeps_contexts() {
         let store = temp_store("rename");
-        store.save_index(&Index { name: "old".into(), contexts: vec!["c1".into()], author: None }).unwrap();
-        store.save_index(&Index { name: "other".into(), contexts: vec![], author: None }).unwrap();
-        store.set_default_index("old").unwrap();
+        store.save_index(&Index { name: "old".into(), contexts: vec!["c1".into()], author: None, description: String::new() }).unwrap();
+        store.save_index(&Index { name: "other".into(), contexts: vec![], author: None, description: String::new() }).unwrap();
 
         store.rename_index("old", "new").unwrap();
         assert!(store.index("old").is_none());
         assert_eq!(store.index("new").unwrap().contexts, vec!["c1".to_owned()]);
-        assert_eq!(store.default_index().as_deref(), Some("new"));
     }
 
     #[test]
-    fn default_index_falls_back_to_first() {
-        let store = temp_store("default");
-        assert_eq!(store.default_index(), None);
-        store.save_index(&Index { name: "b".into(), contexts: vec![], author: None }).unwrap();
-        store.save_index(&Index { name: "a".into(), contexts: vec![], author: None }).unwrap();
-        assert_eq!(store.default_index().as_deref(), Some("a"));
+    fn old_config_with_default_index_still_loads() {
+        let store = temp_store("old-config");
+        fs::write(store.root().join("config.json"), r#"{"mcp_port": 50000, "default_index": "x", "language": "en"}"#).unwrap();
+        assert_eq!(store.config().mcp_port, 50000);
+        store.save_config(&store.config()).unwrap();
+        assert!(!fs::read_to_string(store.root().join("config.json")).unwrap().contains("default_index"));
+    }
 
-        store.set_default_index("b").unwrap();
-        assert_eq!(store.default_index().as_deref(), Some("b"));
-        // 지정했던 인덱스가 지워지면 다시 첫 인덱스
-        store.delete_index("b").unwrap();
-        assert_eq!(store.default_index().as_deref(), Some("a"));
+    #[test]
+    fn folder_hints_are_recent_first_and_closest_first() {
+        let store = temp_store("folders");
+        for name in ["a", "b", "c", "d", "inner"] {
+            store.save_index(&Index { name: name.into(), ..Index::default() }).unwrap();
+        }
+        for name in ["a", "b", "c", "d"] {
+            store.remember_folder_index("/w/app/", name).unwrap();
+        }
+        store.remember_folder_index("/w/app", "b").unwrap();
+        store.remember_folder_index("/w/app/sub", "inner").unwrap();
+
+        let at = |folder: &str| store.folder_hints(&[folder.to_owned()]);
+        // 최근 것부터 3개
+        assert_eq!(at("/w/app"), vec!["b", "d", "c"]);
+        assert_eq!(at("/w/app/src"), vec!["b", "d", "c"]);
+        // 가까운 폴더 것이 먼저
+        assert_eq!(at("/w/app/sub/x"), vec!["inner", "b", "d", "c"]);
+        assert!(at("/w/apple").is_empty());
+        assert!(store.folder_hints(&[]).is_empty());
+
+        // 이름을 바꾸면 따라가고, 지우면 빠진다
+        store.rename_index("b", "renamed").unwrap();
+        assert_eq!(at("/w/app"), vec!["renamed", "d", "c"]);
+        store.delete_index("d").unwrap();
+        assert_eq!(at("/w/app"), vec!["renamed", "c"]);
+    }
+
+    #[test]
+    fn old_single_folder_format_still_loads() {
+        let store = temp_store("old-folders");
+        store.save_index(&Index { name: "x".into(), ..Index::default() }).unwrap();
+        fs::write(store.root().join("config.json"), r#"{"mcp_port": 47614, "folders": {"/w/app": "x"}}"#).unwrap();
+        assert_eq!(store.folder_hints(&["/w/app".into()]), vec!["x"]);
     }
 
     #[test]

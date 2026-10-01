@@ -60,7 +60,7 @@ Octo takes a different approach, built on three principles:
  ┌──────────────── Octo (tray app) ────────────────┐
  │                                                 │
  │  Contexts             Indexes                   │        ┌──────────────┐
- │  ├─ Doc   Payment ──▶ backend ★ (default)       │  MCP   │ Claude Code  │
+ │  ├─ Doc   Payment ──▶ backend "API and billing" │  MCP   │ Claude Code  │
  │  ├─ Path  src/    ──▶  1. Payment policy        │◀──────▶│ Cursor       │
  │  ├─ Path  https://…    2. Source folder         │  HTTP  │ Codex …      │
  │  └─ Graph domain  ──▶ frontend                  │        └──────────────┘
@@ -94,8 +94,8 @@ The whole flow fits on one screen:
 ### Indexes
 
 - One context can be added to any number of indexes.
-- A **default index** is what new sessions start with.
-- An agent can switch indexes during a session with `use_index`. The switch applies only to that session.
+- **Indexes aren't tied to a session.** For every message, the agent picks the index that fits the topic and opens it with `get_index(index)`, several at once if the topic spans them. There is no default index.
+- A **one-line description** on each index is what the agent picks by. Without one, the first few context titles stand in.
 
 ### A single MCP endpoint
 
@@ -151,13 +151,13 @@ The app is a single screen that flows from left to right.
 | Panel | What it shows | What you do there |
 |---|---|---|
 | **① Contexts** | Every registered context, with its kind badge and one-line summary. You can filter by kind or search. | Add and edit contexts, then add them to the selected index with **Add ›**. |
-| **② Indexes** | All indexes as a collapsible list. The ★ default index is marked. | Reorder contexts with ↑ ↓, remove them with ✕, rename or delete an index. |
-| **③ Session** | Claude Code connection status, the MCP address, and a live preview of the table of contents a session receives. | Connect or disconnect Claude Code, or copy the address or JSON for other tools. |
+| **② Indexes** | All indexes as a collapsible list, each with its one-line description. | Reorder contexts with ↑ ↓, remove them with ✕, edit the description, rename, export, or delete an index. |
+| **③ Session** | Claude Code connection status, the MCP address, and a live preview of the table of contents a session gets for the open index. | Connect or disconnect Claude Code, or copy the address or JSON for other tools. |
 
 1. In **① Contexts**, click **+ Add** and register a doc, a path, or a graph query.
-2. In **② Indexes**, create an index and add contexts to it. Click **★ Make default** to make it the default.
+2. In **② Indexes**, create an index, give it a one-line description with **✎ Description**, and add contexts to it.
 3. In **③ Session**, click **Connect in one click** for Claude Code, or copy the JSON for another agent.
-4. Open a new agent session. The agent can now call `get_index`.
+4. Open a new agent session and just ask. The agent picks the matching index and calls `get_index`.
 
 ## Connecting an agent
 
@@ -177,29 +177,27 @@ claude mcp add --transport http --scope user octo http://127.0.0.1:47614/mcp
 }
 ```
 
-**Choosing the index.** A session resolves its index in this order:
+**Choosing the index.** The session instructions list every index with its description, and the agent chooses per message. To help it choose, `list_indexes` puts hints first:
 
-1. The index chosen in that session with `use_index`
-2. An `?index=<name>` query parameter on the URL. Use this to pin an index per project, for example `http://127.0.0.1:47614/mcp?index=backend`.
-3. The default index set in the app
+1. An `?index=<name>` query parameter on the URL, for example `http://127.0.0.1:47614/mcp?index=backend`. This is a hint, not a pin; useful for clients that don't report their working folder.
+2. The indexes recently opened in the session's working folder (up to 3). Clients that support MCP `roots` report the folder on the first tool call, and every `get_index` there is remembered.
 
 ## MCP tools
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `get_index` | none | Table of contents for the current index: id, kind, title, one-line summary, and status. |
-| `load_context` | `id` | Full content of one context. |
-| `list_indexes` | none | Available indexes. Marks the current and default ones. |
-| `use_index` | `name` | Switches the index for this session only. |
+| `get_index` | `index` | Table of contents for one index: id, kind, title, one-line summary, and status. Call it per topic. |
+| `load_context` | `id` | Full content of one context from any index. Contexts that aren't in any index stay closed. |
+| `list_indexes` | none | Name, description, and size of every index, with the ones recently used in this project first. |
 | `report_access` | `id`, `method`, `content?`, `version?` | Records how the agent opened a link Octo couldn't fetch, and optionally what it read. |
-| `add_context` | `title`, `summary?`, `body` or `path` | Saves something later sessions should know as a new context in the current index. Rejects a title that already exists in the index. |
+| `add_context` | `index`, `title`, `summary?`, `body` or `path` | Saves something later sessions should know as a new context in the given index. Rejects a title that already exists in the index. |
 | `update_context` | `id`, `title?`, `summary?`, `body?`, `path?` | Edits a context an agent created. Once a person saves it in the app, agents can no longer change it. |
 | `delete_context` | `id` | Deletes a context an agent created and removes it from every index. |
-| `create_index` | `name` | Creates an empty index and switches the session to it. |
-| `update_index` | `name?`, `new_name?`, `add?`, `remove?` | Adds existing contexts to an index, takes them out, or renames it. Removing needs the index or the context to be agent-made; renaming needs an agent-made index. |
+| `create_index` | `name`, `description?` | Creates an empty index. |
+| `update_index` | `name`, `new_name?`, `description?`, `add?`, `remove?` | Adds existing contexts to an index, takes them out, or changes its name or description. Removing needs the index or the context to be agent-made; name and description changes need an agent-made index. |
 | `delete_index` | `name` | Deletes an index an agent created. Its contexts remain. |
 
-| `export_indexes` | `indexes?`, `all?`, `path?`, `include_secrets?`, `attach_large?` | Exports indexes to a `.octo.zip`. See [Import and export](#import-and-export). |
+| `export_indexes` | `indexes` or `all`, `path?`, `include_secrets?`, `attach_large?` | Exports indexes to a `.octo.zip`. See [Import and export](#import-and-export). |
 | `import_indexes` | `path`, `dry_run?` | Imports a `.octo.zip`. Agents are told to show the `dry_run` summary to the user first. |
 
 Agents can only rename or delete what they created. Once a person edits a context or an index in the app, it belongs to the person and agents are told to ask the user instead.
@@ -274,7 +272,7 @@ All data stays on your machine.
 
 ```text
 ~/.octo/
-├─ config.json            MCP port, default index, language
+├─ config.json            MCP port, language, indexes recently used per working folder
 ├─ contexts/<id>.json     Context definitions (doc bodies in <id>.md)
 ├─ indexes/<name>.json    Indexes and their order
 ├─ connections/           neo4j connection settings (passwords excluded)

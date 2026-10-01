@@ -1,15 +1,20 @@
 //! 데몬이 여는 Streamable HTTP MCP 서버. 주소 하나(`/mcp`)를 한 번만 연결하면 된다.
 //!
-//! 세션이 쓰는 인덱스는 이 순서로 정한다:
-//! 1. 세션 안에서 `use_index`로 바꾼 인덱스 (`Mcp-Session-Id`별로 기억)
-//! 2. 주소에 붙인 `?index=<이름>` (프로젝트마다 고정하고 싶을 때)
-//! 3. 앱에서 정한 기본 인덱스
+//! 인덱스는 세션에 고정되지 않는다. 에이전트가 사용자 메시지마다 주제에 맞는 인덱스를 골라
+//! `get_index(index)`로 목차를 열고, `load_context(id)`로 어느 인덱스의 항목이든 연다. 기본 인덱스는 없다.
+//!
+//! 고르는 데 쓰는 힌트는 목록 맨 앞에 둔다:
+//! 1. 주소에 붙인 `?index=<이름>` (roots를 모르는 클라이언트용)
+//! 2. 작업 폴더에서 최근 연 인덱스. 폴더는 클라이언트가 `roots`를 지원하면 첫 도구 호출 때
+//!    `roots/list`로 묻는다. 그 응답을 SSE로 흘려 보내는 동안 요청 안에서 물어볼 수 있다.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::sync::{Arc, LazyLock, Mutex, mpsc as sync_mpsc};
 use std::thread;
+use std::time::Duration;
 
 use futures::channel::mpsc;
 use futures::Stream;
@@ -40,16 +45,24 @@ pub fn config_snippet(port: u16) -> String {
 
 #[derive(Default)]
 struct Session {
-    /// `use_index`로 고른 인덱스
-    index: Option<String>,
     /// initialize의 clientInfo.name. 에이전트가 보고한 접근 방식에 함께 남긴다.
     client: Option<String>,
+    /// initialize에서 클라이언트가 `roots`를 지원한다고 했는지
+    roots: bool,
+    /// `roots/list`로 받은 작업 폴더. None이면 아직 묻지 않았다 (물었는데 실패하면 빈 목록).
+    folders: Option<Vec<String>>,
 }
 
 /// 세션 id → 세션
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 
 static CHANGED: Mutex<Option<mpsc::UnboundedSender<()>>> = Mutex::new(None);
+
+/// 서버가 클라이언트에 보낸 요청 id → 그 응답을 기다리는 요청 스레드
+static PENDING: LazyLock<Mutex<HashMap<String, sync_mpsc::Sender<Value>>>> = LazyLock::new(Mutex::default);
+
+/// `roots/list` 응답을 기다리는 시간. 넘기면 폴더 없이 진행한다.
+const ROOTS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 에이전트가 컨텍스트나 인덱스를 바꿀 때마다 이벤트를 낸다. 열린 창이 목록을 다시 읽는 데 쓴다.
 pub fn changes() -> Subscription<()> {
@@ -130,11 +143,21 @@ fn handle(store: &Store, sessions: &Sessions, mut request: Request) {
         return respond_json(request, &error(Value::Null, -32700, "parse error"), None);
     };
 
-    // 알림(id 없음)이나 클라이언트의 응답은 받기만 한다
+    // 알림(id 없음)은 받기만 한다. 작업 폴더가 바뀌었다는 알림이면 다음 도구 호출 때 다시 묻는다.
     let Some(id) = message.get("id").cloned() else {
+        if message["method"] == "notifications/roots/list_changed"
+            && let Some(session) = sessions.lock().unwrap().get_mut(session.as_deref().unwrap_or_default())
+        {
+            session.folders = None;
+        }
         return respond(request, 202, "");
     };
+    // method가 없으면 서버가 보낸 요청에 대한 클라이언트의 응답이다
     let Some(method) = message["method"].as_str() else {
+        let waiting = id.as_str().and_then(|id| PENDING.lock().unwrap().remove(id));
+        if let Some(waiting) = waiting {
+            let _ = waiting.send(message);
+        }
         return respond(request, 202, "");
     };
 
@@ -143,16 +166,85 @@ fn handle(store: &Store, sessions: &Sessions, mut request: Request) {
         "initialize" => {
             let session = store::new_id();
             let client = message["params"]["clientInfo"]["name"].as_str().map(str::to_owned);
-            ctx.sessions.lock().unwrap().insert(session.clone(), Session { index: None, client });
+            let roots = message["params"]["capabilities"]["roots"].is_object();
+            ctx.sessions.lock().unwrap().insert(session.clone(), Session { client, roots, ..Session::default() });
             ctx.session = Some(session.clone());
             (success(id, initialize(&ctx, &message["params"])), Some(session))
         }
         "ping" => (success(id, json!({})), None),
         "tools/list" => (success(id, json!({ "tools": tools() })), None),
+        "tools/call" if ctx.should_ask_folders() && accepts_stream(&request) => {
+            return call_asking_folders(&ctx, request, id, &message["params"]);
+        }
         "tools/call" => (success(id, call(&ctx, &message["params"])), None),
         _ => (error(id, -32601, &format!("method not found: {method}")), None),
     };
     respond_json(request, &reply, new_session.as_deref());
+}
+
+/// 응답을 SSE로 열고, 먼저 클라이언트에 `roots/list`를 물어 세션의 작업 폴더를 채운 뒤 도구를 실행한다.
+fn call_asking_folders(ctx: &Ctx, request: Request, id: Value, params: &Value) {
+    let mut stream = request.into_writer();
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let folders = ask_folders(&mut stream);
+    if let Some(session) = ctx.sessions.lock().unwrap().get_mut(ctx.session.as_deref().unwrap_or_default()) {
+        session.folders = Some(folders);
+    }
+    let reply = success(id, call(ctx, params));
+    let _ = send_event(&mut stream, &reply).and_then(|()| stream.write_all(b"0\r\n\r\n")).and_then(|()| stream.flush());
+}
+
+/// 열린 SSE 응답으로 `roots/list`를 보내고 응답을 기다린다. 못 받으면 빈 목록.
+fn ask_folders(stream: &mut impl Write) -> Vec<String> {
+    let request_id = format!("octo-roots-{}", store::new_id());
+    let (tx, rx) = sync_mpsc::channel();
+    PENDING.lock().unwrap().insert(request_id.clone(), tx);
+    let asked = send_event(stream, &json!({ "jsonrpc": "2.0", "id": request_id, "method": "roots/list" }));
+    let answer = asked.ok().and_then(|()| rx.recv_timeout(ROOTS_TIMEOUT).ok());
+    PENDING.lock().unwrap().remove(&request_id);
+
+    let roots = answer.as_ref().and_then(|answer| answer["result"]["roots"].as_array()).into_iter().flatten();
+    roots.filter_map(|root| root["uri"].as_str()).filter_map(file_uri_path).collect()
+}
+
+/// SSE 이벤트 하나를 청크 하나로 보내고 바로 내보낸다.
+fn send_event(stream: &mut impl Write, message: &Value) -> std::io::Result<()> {
+    let event = format!("event: message\ndata: {message}\n\n");
+    write!(stream, "{:x}\r\n{event}\r\n", event.len())?;
+    stream.flush()
+}
+
+/// `file:///Users/me/my%20app` → `/Users/me/my app`. file URI가 아니면 None.
+fn file_uri_path(uri: &str) -> Option<String> {
+    let path = uri.strip_prefix("file://")?;
+    let path = path.strip_prefix("localhost").unwrap_or(path);
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+    let path = String::from_utf8(decoded).ok()?;
+    let path = path.trim_end_matches('/');
+    path.starts_with('/').then(|| path.to_owned())
+}
+
+/// 클라이언트가 SSE 응답을 받겠다고 했는지 (Streamable HTTP의 Accept)
+fn accepts_stream(request: &Request) -> bool {
+    header(request, "Accept").is_some_and(|accept| accept.contains("text/event-stream"))
 }
 
 /// 요청 하나를 처리하는 데 필요한 것
@@ -160,19 +252,58 @@ struct Ctx<'a> {
     store: &'a Store,
     sessions: &'a Sessions,
     session: Option<String>,
+    /// 주소의 `?index=`. 고정이 아니라 목록 맨 앞에 두는 힌트다.
     pinned: Option<String>,
 }
 
 impl Ctx<'_> {
-    /// 지금 이 세션이 쓰는 인덱스
-    fn index(&self) -> Option<String> {
-        // use_index로 고른 인덱스가 이름이 바뀌었거나 지워졌으면 다음 순위로 넘어간다
-        let chosen = self
-            .session
-            .as_ref()
-            .and_then(|s| self.sessions.lock().unwrap().get(s).and_then(|s| s.index.clone()))
-            .filter(|name| self.store.index(name).is_some());
-        chosen.or_else(|| self.pinned.clone()).or_else(|| self.store.default_index())
+    /// 인덱스 목록 맨 앞에 둘 힌트: 주소의 `?index=`, 그다음 작업 폴더에서 최근 연 것
+    fn hints(&self) -> Vec<String> {
+        let mut hints: Vec<String> = self.pinned.iter().filter(|name| self.store.index(name).is_some()).cloned().collect();
+        for name in self.store.folder_hints(&self.folders()) {
+            if !hints.contains(&name) {
+                hints.push(name);
+            }
+        }
+        hints
+    }
+
+    /// 작업 폴더에서 이 인덱스를 열었다고 기억한다. 다음 세션의 목록 정렬에 쓴다.
+    fn remember_opened(&self, name: &str) {
+        if let Some(folder) = self.folders().into_iter().next() {
+            let _ = self.store.remember_folder_index(&folder, name);
+        }
+    }
+
+    /// 인덱스 이름이 필요한 도구에 이름이 없을 때: 고를 수 있는 인덱스를 함께 보여준다
+    fn needs_index(&self) -> String {
+        if self.store.indexes().is_empty() {
+            return t(
+                "Octo에 인덱스가 없습니다. 사용자가 원하면 create_index로 만들고 add_context로 채우세요.",
+                "Octo has no index yet. If the user wants one, create it with create_index and fill it with add_context.",
+            )
+            .into();
+        }
+        tr!(
+            "index 인자가 필요합니다. 아래에서 메시지 주제에 맞는 인덱스를 고르세요. 어느 것인지 애매하면 사용자에게 물어보세요.\n\n{}",
+            "The index argument is required. Pick the one that fits the message from below. If it's unclear which, ask the user.\n\n{}",
+            list_indexes(self)
+        )
+    }
+
+    fn with_session<T>(&self, read: impl FnOnce(&Session) -> T) -> Option<T> {
+        let session = self.session.as_ref()?;
+        self.sessions.lock().unwrap().get(session).map(read)
+    }
+
+    /// `roots/list`로 받은 이 세션의 작업 폴더 (모르면 빈 목록)
+    fn folders(&self) -> Vec<String> {
+        self.with_session(|s| s.folders.clone()).flatten().unwrap_or_default()
+    }
+
+    /// 클라이언트가 roots를 지원하는데 아직 작업 폴더를 묻지 않았는지
+    fn should_ask_folders(&self) -> bool {
+        self.with_session(|s| s.roots && s.folders.is_none()).unwrap_or(false)
     }
 
     fn client(&self) -> String {
@@ -190,26 +321,33 @@ fn initialize(ctx: &Ctx, params: &Value) -> Value {
         .find(|v| *v == requested)
         .unwrap_or(SUPPORTED_VERSIONS[0]);
 
-    let instructions = match ctx.index() {
-        Some(index) => tr!(
-            "Octo 컨텍스트 인덱스 '{index}'가 연결되어 있습니다. \
-             작업 전에 get_index로 목차를 보고, 필요한 항목만 load_context로 본문을 가져오세요. \
-             사용자가 다른 인덱스를 원하면 list_indexes로 확인하고 use_index로 바꾸세요. \
-             octo가 열지 못한 링크를 다른 도구로 읽었다면 report_access로 방식과 본문을 남기세요. \
-             작업 중 다음 세션도 알아야 할 내용을 알게 되면 add_context로 남기고, 직접 남긴 항목은 update_context·delete_context로 고치거나 지우세요. \
-             인덱스는 create_index·update_index·delete_index로 관리합니다. 사람이 만든 항목은 바꾸지 못하니 바꿀 내용을 사용자에게 알려 주세요.",
-            "The Octo context index '{index}' is connected. \
-             Before working, call get_index to see the table of contents, then load only the items you need with load_context. \
-             If the user wants a different index, check list_indexes and switch with use_index. \
-             If you read a link octo couldn't open with another tool, leave the method and content with report_access. \
-             When you learn something later sessions should know, save it with add_context, and fix or delete items you saved with update_context and delete_context. \
-             Manage indexes with create_index, update_index, and delete_index. Person-made items can't be changed; tell the user what should change."
-        ),
-        None => t(
+    let instructions = if ctx.store.indexes().is_empty() {
+        t(
             "Octo에 아직 인덱스가 없습니다. 사용자가 원하면 create_index로 만들고 add_context로 채우세요.",
             "Octo has no index yet. If the user wants one, create it with create_index and fill it with add_context.",
         )
-        .into(),
+        .to_owned()
+    } else {
+        // 작업 폴더는 첫 도구 호출 때 알게 되므로, 이 프로젝트에서 최근 쓴 인덱스 표시는 list_indexes에서 보인다
+        tr!(
+            "Octo 컨텍스트 인덱스는 세션에 고정되지 않습니다. 사용자 메시지마다 주제에 맞는 인덱스를 아래에서 골라 \
+             get_index(index)로 목차를 보고, 필요한 항목만 load_context(id)로 본문을 가져오세요. \
+             주제가 여러 인덱스에 걸치면 여러 개를 열어도 됩니다. 어느 인덱스인지 애매하면 사용자에게 물어보세요. \
+             list_indexes는 이 프로젝트에서 최근 쓴 인덱스를 맨 앞에 보여줍니다. \
+             octo가 열지 못한 링크를 다른 도구로 읽었다면 report_access로 방식과 본문을 남기세요. \
+             다음 세션도 알아야 할 내용은 add_context(index, …)로 남기고, 직접 남긴 항목은 update_context·delete_context로 고치거나 지우세요. \
+             인덱스는 create_index·update_index·delete_index로 관리합니다. 사람이 만든 항목은 바꾸지 못하니 바꿀 내용을 사용자에게 알려 주세요.\n\n\
+             인덱스:\n{}",
+            "Octo context indexes aren't fixed to the session. For each user message, pick the index that fits the topic from below, \
+             read its table of contents with get_index(index), and load only the items you need with load_context(id). \
+             If the topic spans several indexes, open several. If it's unclear which index, ask the user. \
+             list_indexes shows the indexes recently used in this project first. \
+             If you read a link octo couldn't open with another tool, leave the method and content with report_access. \
+             Save what later sessions should know with add_context(index, …), and fix or delete items you saved with update_context and delete_context. \
+             Manage indexes with create_index, update_index, and delete_index. Person-made items can't be changed; tell the user what should change.\n\n\
+             Indexes:\n{}",
+            list_indexes(ctx)
+        )
     };
 
     json!({
@@ -221,46 +359,37 @@ fn initialize(ctx: &Ctx, params: &Value) -> Value {
 }
 
 fn tools() -> Value {
+    let id = json!({ "type": "string", "description": t("get_index 목차의 id", "id from a get_index table of contents") });
     json!([
         {
             "name": "get_index",
             "description": t(
-                "이 세션이 쓰는 컨텍스트 인덱스의 목차를 가져온다. 항목마다 id, 종류, 제목, 한 줄 요약이 있다.",
-                "Get the table of contents of this session's context index. Each item has an id, kind, title, and one-line summary.",
+                "인덱스 하나의 목차를 가져온다. 사용자 메시지의 주제에 맞는 인덱스를 고르고, 여러 주제면 여러 번 부른다. \
+                 항목마다 id, 종류, 제목, 한 줄 요약이 있다.",
+                "Get one index's table of contents. Pick the index that fits the user message's topic; call it again for other topics. \
+                 Each item has an id, kind, title, and one-line summary.",
             ),
-            "inputSchema": { "type": "object", "properties": {} },
+            "inputSchema": {
+                "type": "object",
+                "properties": { "index": { "type": "string", "description": t("list_indexes의 인덱스 이름", "Index name from list_indexes") } },
+                "required": ["index"],
+            },
         },
         {
             "name": "load_context",
             "description": t(
-                "목차의 id로 컨텍스트 본문을 가져온다. 문서는 본문, 경로는 파일 내용이나 폴더 목록, 그래프는 쿼리 결과.",
-                "Load a context's content by its table-of-contents id. Doc: the text. Path: file content, folder listing, or page text for links. Graph: query result.",
+                "목차의 id로 컨텍스트 본문을 가져온다. 어느 인덱스의 목차든 된다. 문서는 본문, 경로는 파일 내용이나 폴더 목록, 그래프는 쿼리 결과.",
+                "Load a context's content by its id from any index's table of contents. Doc: the text. Path: file content, folder listing, or page text for links. Graph: query result.",
             ),
-            "inputSchema": {
-                "type": "object",
-                "properties": { "id": { "type": "string", "description": t("get_index 목차의 id", "id from the get_index table of contents") } },
-                "required": ["id"],
-            },
+            "inputSchema": { "type": "object", "properties": { "id": id }, "required": ["id"] },
         },
         {
             "name": "list_indexes",
             "description": t(
-                "쓸 수 있는 인덱스 목록. 지금 세션이 쓰는 인덱스와 기본 인덱스를 표시한다.",
-                "List available indexes, marking the one this session uses and the default.",
+                "쓸 수 있는 인덱스의 이름·설명·개수. 이 프로젝트에서 최근 쓴 인덱스를 맨 앞에 둔다.",
+                "Names, descriptions, and sizes of available indexes, with the ones recently used in this project first.",
             ),
             "inputSchema": { "type": "object", "properties": {} },
-        },
-        {
-            "name": "use_index",
-            "description": t(
-                "이 세션이 쓸 인덱스를 바꾼다. 다른 세션에는 영향이 없다.",
-                "Switch the index this session uses. Other sessions are not affected.",
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": { "name": { "type": "string", "description": t("list_indexes의 인덱스 이름", "index name from list_indexes") } },
-                "required": ["name"],
-            },
         },
         {
             "name": "report_access",
@@ -271,7 +400,7 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": t("get_index 목차의 링크 컨텍스트 id", "id of a link context from get_index") },
+                    "id": { "type": "string", "description": t("목차의 링크 컨텍스트 id", "id of a link context from a table of contents") },
                     "method": { "type": "string", "description": t("연 방식. 다른 에이전트가 따라 할 수 있게 도구 이름과 인자까지", "How you opened it, with the tool name and arguments so another agent can repeat it") },
                     "content": { "type": "string", "description": t("읽은 본문 텍스트. 없으면 방식만 남긴다", "The text you read. Omit to leave only the method") },
                     "version": { "type": "string", "description": t("원본이 알려준 버전이나 수정 시각. 나중에 최신인지 비교하는 데 쓴다", "Version or modified time the source reported, used later to check freshness") },
@@ -282,11 +411,11 @@ fn tools() -> Value {
         {
             "name": "add_context",
             "description": t(
-                "다음 세션도 알아야 할 내용을 이 세션의 인덱스에 새 컨텍스트로 남긴다. \
+                "다음 세션도 알아야 할 내용을 인덱스에 새 컨텍스트로 남긴다. 어느 인덱스에 넣을지 index로 꼭 정하고, 애매하면 사용자에게 묻는다. \
                  먼저 get_index로 비슷한 항목이 있는지 보고, 있으면 update_context를 쓴다. \
                  이미 파일이나 링크로 있는 내용은 복사하지 말고 path로 가리킨다. \
                  body는 결정 사항, 조사 결과처럼 어디에도 없는 내용에만 쓴다. body와 path 중 하나만 준다.",
-                "Save something later sessions should know as a new context in this session's index. \
+                "Save something later sessions should know as a new context in an index. Always choose the index; ask the user if unclear. \
                  Check get_index for a similar item first and use update_context if there is one. \
                  Don't copy content that already lives in a file or link; point to it with path. \
                  Use body only for things that exist nowhere else, such as decisions or findings. Give exactly one of body or path.",
@@ -294,12 +423,13 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "index": { "type": "string", "description": t("넣을 인덱스 이름", "Index to add it to") },
                     "title": { "type": "string", "description": t("목차에 보일 제목", "Title shown in the table of contents") },
                     "summary": { "type": "string", "description": t("목차에 보일 한 줄 요약. 없으면 본문 첫 줄", "One-line summary for the table of contents. Defaults to the first line") },
                     "body": { "type": "string", "description": t("문서 본문 (Markdown)", "Document text (Markdown)") },
                     "path": { "type": "string", "description": t("원본 파일·폴더의 절대 경로나 링크(URL)", "Absolute path to the source file or folder, or a link (URL)") },
                 },
-                "required": ["title"],
+                "required": ["index", "title"],
             },
         },
         {
@@ -313,7 +443,7 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": t("get_index 목차의 id", "id from the get_index table of contents") },
+                    "id": id,
                     "title": { "type": "string", "description": t("새 제목", "New title") },
                     "summary": { "type": "string", "description": t("새 한 줄 요약. 빈 문자열이면 본문 첫 줄로 돌아간다", "New one-line summary. An empty string falls back to the first line") },
                     "body": { "type": "string", "description": t("새 문서 본문 전체 (Markdown)", "Full new document text (Markdown)") },
@@ -328,40 +458,41 @@ fn tools() -> Value {
                 "에이전트가 남긴 컨텍스트를 지운다. 담겨 있던 모든 인덱스에서도 빠진다. 사람이 만들거나 고친 항목은 지울 수 없다.",
                 "Delete a context an agent saved. It is also removed from every index. Items a person created or edited can't be deleted.",
             ),
-            "inputSchema": {
-                "type": "object",
-                "properties": { "id": { "type": "string", "description": t("get_index 목차의 id", "id from the get_index table of contents") } },
-                "required": ["id"],
-            },
+            "inputSchema": { "type": "object", "properties": { "id": id }, "required": ["id"] },
         },
         {
             "name": "create_index",
             "description": t(
-                "빈 인덱스를 만들고 이 세션이 그 인덱스를 쓰게 한다. 이름은 영문·숫자·-·_ (64자 이내).",
-                "Create an empty index and switch this session to it. Names use letters, numbers, - and _ (up to 64).",
+                "빈 인덱스를 만든다. 다른 세션이 주제로 고를 수 있게 description에 한 줄 설명을 꼭 넣는다. 이름은 영문·숫자·-·_ (64자 이내).",
+                "Create an empty index. Give it a one-line description so other sessions can pick it by topic. Names use letters, numbers, - and _ (up to 64).",
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": { "name": { "type": "string", "description": t("새 인덱스 이름", "New index name") } },
+                "properties": {
+                    "name": { "type": "string", "description": t("새 인덱스 이름", "New index name") },
+                    "description": { "type": "string", "description": t("무엇에 관한 인덱스인지 한 줄", "One line on what the index is about") },
+                },
                 "required": ["name"],
             },
         },
         {
             "name": "update_index",
             "description": t(
-                "인덱스 목차에 기존 컨텍스트를 넣거나 빼고, 이름을 바꾼다. name을 빼면 이 세션의 인덱스. \
-                 넣기는 어느 인덱스든 되고, 빼기는 인덱스나 컨텍스트가 에이전트 것일 때만, 이름 바꾸기는 에이전트가 만든 인덱스만 된다.",
-                "Add existing contexts to an index's table of contents, remove them, or rename it. Omit name for this session's index. \
-                 Adding works on any index; removing needs the index or the context to be agent-made; renaming needs an agent-made index.",
+                "인덱스 목차에 기존 컨텍스트를 넣거나 빼고, 이름·설명을 바꾼다. \
+                 넣기는 어느 인덱스든 되고, 빼기는 인덱스나 컨텍스트가 에이전트 것일 때만, 이름·설명 바꾸기는 에이전트가 만든 인덱스만 된다.",
+                "Add existing contexts to an index's table of contents, remove them, or change its name or description. \
+                 Adding works on any index; removing needs the index or the context to be agent-made; name and description changes need an agent-made index.",
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": t("고칠 인덱스 이름", "Index to edit") },
                     "new_name": { "type": "string", "description": t("새 이름", "New name") },
+                    "description": { "type": "string", "description": t("새 한 줄 설명", "New one-line description") },
                     "add": { "type": "array", "items": { "type": "string" }, "description": t("목차 끝에 넣을 컨텍스트 id", "Context ids to append") },
                     "remove": { "type": "array", "items": { "type": "string" }, "description": t("목차에서 뺄 컨텍스트 id (컨텍스트는 남는다)", "Context ids to take out (the contexts remain)") },
                 },
+                "required": ["name"],
             },
         },
         {
@@ -380,9 +511,9 @@ fn tools() -> Value {
             "name": "export_indexes",
             "description": t(
                 "인덱스를 zip(.octo.zip)으로 내보낸다. 목차의 컨텍스트와 문서 본문, 경로가 가리키는 파일·폴더까지 담는다. \
-                 indexes와 all을 모두 빼면 이 세션의 인덱스. 첨부가 100MB를 넘는 컨텍스트는 attach_large가 없으면 경로만 담는다.",
+                 indexes나 all 중 하나를 준다. 첨부가 100MB를 넘는 컨텍스트는 attach_large가 없으면 경로만 담는다.",
                 "Export indexes as a zip (.octo.zip) with their contexts, document text, and the files and folders paths point to. \
-                 Omit both indexes and all for this session's index. Contexts whose attachment exceeds 100MB get only their path unless attach_large is set.",
+                 Pass indexes or all. Contexts whose attachment exceeds 100MB get only their path unless attach_large is set.",
             ),
             "inputSchema": {
                 "type": "object",
@@ -418,89 +549,92 @@ fn tools() -> Value {
 }
 
 fn call(ctx: &Ctx, params: &Value) -> Value {
-    let no_index = || {
-        t(
-            "Octo에 인덱스가 없습니다. create_index로 만들거나 앱에서 먼저 만들어 주세요",
-            "Octo has no index. Create one with create_index or in the app first",
-        )
-        .to_owned()
-    };
+    let args = &params["arguments"];
     let result = match params["name"].as_str() {
-        Some("get_index") => ctx.index().ok_or_else(no_index).and_then(|index| content::toc(ctx.store, &index)),
-        Some("load_context") => match params["arguments"]["id"].as_str() {
-            Some(id) => ctx
-                .index()
-                .ok_or_else(no_index)
-                .and_then(|index| content::load_in_index(ctx.store, &index, id)),
+        Some("get_index") => get_index(ctx, args),
+        Some("load_context") => match args["id"].as_str() {
+            Some(id) => content::load_listed(ctx.store, id),
             None => Err(t("id 인자가 필요합니다", "The id argument is required").into()),
         },
         Some("list_indexes") => Ok(list_indexes(ctx)),
-        Some("report_access") => ctx.index().ok_or_else(no_index).and_then(|index| report_access(ctx, &index, &params["arguments"])),
-        Some("use_index") => use_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
-        Some("add_context") => ctx.index().ok_or_else(no_index).and_then(|index| add_context(ctx, &index, &params["arguments"])),
-        Some("update_context") => ctx.index().ok_or_else(no_index).and_then(|index| update_context(ctx, &index, &params["arguments"])),
-        Some("delete_context") => ctx.index().ok_or_else(no_index).and_then(|index| delete_context(ctx, &index, &params["arguments"])),
-        Some("create_index") => create_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
-        Some("update_index") => update_index(ctx, &params["arguments"]),
-        Some("delete_index") => delete_index(ctx, params["arguments"]["name"].as_str().unwrap_or_default()),
-        Some("export_indexes") => export_indexes(ctx, &params["arguments"]),
-        Some("import_indexes") => import_indexes(ctx, &params["arguments"]),
+        Some("report_access") => report_access(ctx, args),
+        Some("add_context") => match text_arg(args, "index") {
+            Some(index) => add_context(ctx, &index, args),
+            None => Err(ctx.needs_index()),
+        },
+        Some("update_context") => update_context(ctx, args),
+        Some("delete_context") => delete_context(ctx, args),
+        Some("create_index") => create_index(ctx, args),
+        Some("update_index") => update_index(ctx, args),
+        Some("delete_index") => delete_index(ctx, args["name"].as_str().unwrap_or_default()),
+        Some("export_indexes") => export_indexes(ctx, args),
+        Some("import_indexes") => import_indexes(ctx, args),
         other => Err(tr!("알 수 없는 도구: {}", "Unknown tool: {}", other.unwrap_or(""))),
     };
     tool_result(result)
 }
 
+/// 메시지 주제에 맞는 인덱스의 목차. 연 인덱스는 작업 폴더의 최근 목록에 쌓인다.
+fn get_index(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let name = text_arg(args, "index").ok_or_else(|| ctx.needs_index())?;
+    if ctx.store.index(&name).is_none() {
+        return Err(tr!("인덱스 없음: '{name}'\n\n{}", "No index '{name}'\n\n{}", list_indexes(ctx)));
+    }
+    let toc = content::toc(ctx.store, &name)?;
+    ctx.remember_opened(&name);
+    Ok(toc)
+}
+
+/// 이름·설명·개수. 이 프로젝트에서 최근 쓴 인덱스(힌트)를 앞에 둔다.
 fn list_indexes(ctx: &Ctx) -> String {
-    let current = ctx.index();
-    let default = ctx.store.default_index();
-    let indexes = ctx.store.indexes();
+    let mut indexes = ctx.store.indexes();
     if indexes.is_empty() {
         return t("(인덱스 없음)", "(no indexes)").into();
     }
+    let hints = ctx.hints();
+    indexes.sort_by_key(|index| hints.iter().position(|h| *h == index.name).unwrap_or(usize::MAX));
     indexes
         .iter()
         .map(|index| {
             let mut marks = Vec::new();
-            if current.as_deref() == Some(index.name.as_str()) {
-                marks.push(t("현재 세션", "current session"));
-            }
-            if default.as_deref() == Some(index.name.as_str()) {
-                marks.push(t("기본", "default"));
+            if hints.contains(&index.name) {
+                marks.push(t("이 프로젝트에서 최근 씀", "recently used in this project"));
             }
             if index.author.is_some() {
                 marks.push(t("에이전트 작성", "agent-made"));
             }
             let marks = if marks.is_empty() { String::new() } else { format!(" [{}]", marks.join(", ")) };
-            tr!("- {} — 컨텍스트 {}개{marks}", "- {} — {} contexts{marks}", index.name, index.contexts.len())
+            tr!(
+                "- {} — {} (컨텍스트 {}개){marks}",
+                "- {} — {} ({} contexts){marks}",
+                index.name,
+                describe(ctx.store, index),
+                index.contexts.len()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn use_index(ctx: &Ctx, name: &str) -> Result<String, String> {
-    if ctx.store.index(name).is_none() {
-        return Err(tr!("인덱스 없음: '{name}'. list_indexes로 이름을 확인하세요", "No index '{name}'. Check the name with list_indexes"));
+/// 인덱스 한 줄 설명. 비어 있으면 목차 제목 몇 개로 대신한다.
+fn describe(store: &Store, index: &store::Index) -> String {
+    let description = index.description.trim();
+    if !description.is_empty() {
+        return description.to_owned();
     }
-    let Some(session) = &ctx.session else {
-        return Err(t(
-            "세션 id가 없어 바꿀 수 없습니다 (Mcp-Session-Id 헤더 필요)",
-            "Can't switch without a session id (Mcp-Session-Id header required)",
-        )
-        .into());
-    };
-    ctx.sessions.lock().unwrap().entry(session.clone()).or_default().index = Some(name.to_owned());
-    content::toc(ctx.store, name).map(|toc| tr!("이 세션은 이제 '{name}' 인덱스를 씁니다.\n\n{toc}", "This session now uses the '{name}' index.\n\n{toc}"))
+    let titles: Vec<String> = index.contexts.iter().filter_map(|id| store.context(id)).take(3).map(|c| c.title).collect();
+    match titles.len() {
+        0 => t("(비어 있음)", "(empty)").into(),
+        n if n < index.contexts.len() => tr!("{} 외", "{}, …", titles.join(", ")),
+        _ => titles.join(", "),
+    }
 }
 
-fn report_access(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, String> {
+fn report_access(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let id = args["id"].as_str().ok_or(t("id 인자가 필요합니다", "The id argument is required"))?;
     let method = args["method"].as_str().map(str::trim).filter(|m| !m.is_empty());
     let method = method.ok_or(t("method 인자가 필요합니다", "The method argument is required"))?;
-    let index = ctx.store.index(index_name).ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
-    if !index.contexts.iter().any(|c| c == id) {
-        return Err(tr!("'{index_name}' 인덱스에 없는 컨텍스트: {id}", "Context not in index '{index_name}': {id}"));
-    }
-    let context = ctx.store.context(id).ok_or_else(|| tr!("컨텍스트 없음: {id}", "No context: {id}"))?;
+    let context = content::listed(ctx.store, id)?;
     let url = match &context.source {
         Source::Path { path } if web::is_url(path) => path.clone(),
         _ => return Err(t("링크(URL) 컨텍스트에만 남길 수 있습니다", "Only link (URL) contexts can be reported").into()),
@@ -525,7 +659,10 @@ fn add_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, Stri
         (None, Some(path)) => Source::Path { path: checked_path(path)? },
         _ => return Err(t("body와 path 중 하나만 주세요", "Give exactly one of body or path").into()),
     };
-    let mut index = ctx.store.index(index_name).ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
+    let mut index = ctx
+        .store
+        .index(index_name)
+        .ok_or_else(|| tr!("인덱스 없음: '{index_name}'\n\n{}", "No index '{index_name}'\n\n{}", list_indexes(ctx)))?;
     if let Some(existing) = same_title(ctx.store, &index.contexts, &title, None) {
         return Err(duplicate(index_name, &existing));
     }
@@ -549,12 +686,8 @@ fn add_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, Stri
     Ok(tr!("'{index_name}' 인덱스에 추가했습니다. id: {}", "Added to the '{index_name}' index. id: {}", context.id))
 }
 
-fn update_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, String> {
+fn update_context(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let id = args["id"].as_str().ok_or(t("id 인자가 필요합니다", "The id argument is required"))?;
-    let index = ctx.store.index(index_name).ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
-    if !index.contexts.iter().any(|c| c == id) {
-        return Err(tr!("'{index_name}' 인덱스에 없는 컨텍스트: {id}", "Context not in index '{index_name}': {id}"));
-    }
     let mut context = ctx.store.context(id).ok_or_else(|| tr!("컨텍스트 없음: {id}", "No context: {id}"))?;
     if context.author.is_none() {
         return Err(t(
@@ -571,10 +704,13 @@ fn update_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, S
     if title.is_none() && summary.is_none() && body.is_none() && path.is_none() {
         return Err(t("바꿀 값이 없습니다 (title, summary, body, path 중 하나 이상)", "Nothing to change (pass title, summary, body, or path)").into());
     }
-    if let Some(title) = &title
-        && let Some(existing) = same_title(ctx.store, &index.contexts, title, Some(id))
-    {
-        return Err(duplicate(index_name, &existing));
+    // 이 컨텍스트가 담긴 모든 인덱스에서 제목이 겹치지 않아야 한다
+    if let Some(title) = &title {
+        for index in ctx.store.indexes_using(id) {
+            if let Some(existing) = same_title(ctx.store, &index.contexts, title, Some(id)) {
+                return Err(duplicate(&index.name, &existing));
+            }
+        }
     }
 
     let mut old_url = None;
@@ -611,12 +747,8 @@ fn update_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, S
     Ok(tr!("고쳤습니다: {} (id: {id})", "Updated: {} (id: {id})", context.title))
 }
 
-fn delete_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, String> {
+fn delete_context(ctx: &Ctx, args: &Value) -> Result<String, String> {
     let id = args["id"].as_str().ok_or(t("id 인자가 필요합니다", "The id argument is required"))?;
-    let index = ctx.store.index(index_name).ok_or_else(|| tr!("인덱스 없음: '{index_name}'", "No index '{index_name}'"))?;
-    if !index.contexts.iter().any(|c| c == id) {
-        return Err(tr!("'{index_name}' 인덱스에 없는 컨텍스트: {id}", "Context not in index '{index_name}': {id}"));
-    }
     let context = ctx.store.context(id).ok_or_else(|| tr!("컨텍스트 없음: {id}", "No context: {id}"))?;
     if context.author.is_none() {
         return Err(t(
@@ -636,41 +768,50 @@ fn delete_context(ctx: &Ctx, index_name: &str, args: &Value) -> Result<String, S
     Ok(tr!("지웠습니다: {} (id: {id})", "Deleted: {} (id: {id})", context.title))
 }
 
-fn create_index(ctx: &Ctx, name: &str) -> Result<String, String> {
-    let name = name.trim();
+fn create_index(ctx: &Ctx, args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().unwrap_or_default().trim();
     if !store::is_valid_index_name(name) {
         return Err(t("이름은 영문·숫자·-·_ 만, 64자 이내로 쓸 수 있습니다", "Names can only use letters, numbers, - and _, up to 64").into());
     }
     if ctx.store.index(name).is_some() {
-        return Err(tr!("'{name}' 인덱스가 이미 있습니다. use_index로 바꾸세요", "Index '{name}' already exists. Switch to it with use_index"));
+        return Err(tr!("'{name}' 인덱스가 이미 있습니다. get_index로 여세요", "Index '{name}' already exists. Open it with get_index"));
     }
-    let index = store::Index { name: name.to_owned(), contexts: Vec::new(), author: Some(ctx.client()) };
+    let index = store::Index {
+        name: name.to_owned(),
+        description: text_arg(args, "description").unwrap_or_default(),
+        contexts: Vec::new(),
+        author: Some(ctx.client()),
+    };
     ctx.store.save_index(&index).map_err(|err| tr!("만들지 못했습니다: {err}", "Couldn't create it: {err}"))?;
-    if let Some(session) = &ctx.session {
-        ctx.sessions.lock().unwrap().entry(session.clone()).or_default().index = Some(name.to_owned());
-    }
+    // 이 프로젝트를 위해 만든 것이니 최근 목록에 둔다
+    ctx.remember_opened(name);
 
     notify_changed();
-    let mut reply = tr!("'{name}' 인덱스를 만들었고 이 세션은 이제 이 인덱스를 씁니다.", "Created index '{name}'; this session now uses it.");
-    if ctx.store.default_index().as_deref() != Some(name) {
+    let mut reply = tr!("'{name}' 인덱스를 만들었습니다. add_context에 index로 넘겨 채우세요.", "Created index '{name}'. Fill it by passing it as index to add_context.");
+    if index.description.is_empty() {
         reply.push_str(t(
-            " 새 세션은 기본 인덱스를 받으니, 이 인덱스를 기본으로 쓰려면 사용자에게 앱에서 지정해 달라고 하세요.",
-            " New sessions get the default index; ask the user to set this one as default in the app if needed.",
+            " 설명(description)이 없으면 다른 세션이 이 인덱스를 고르기 어려우니 update_index로 한 줄 설명을 넣으세요.",
+            " Without a description other sessions will struggle to pick it; add a one-line description with update_index.",
         ));
     }
     Ok(reply)
 }
 
 fn update_index(ctx: &Ctx, args: &Value) -> Result<String, String> {
-    let name = text_arg(args, "name").or_else(|| ctx.index()).ok_or(t("고칠 인덱스가 없습니다", "No index to edit"))?;
+    let name = text_arg(args, "name").ok_or(t("name 인자가 필요합니다", "The name argument is required"))?;
     let mut index = ctx.store.index(&name).ok_or_else(|| tr!("인덱스 없음: '{name}'", "No index '{name}'"))?;
     let ids = |key: &str| -> Vec<String> {
         args[key].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
     };
     let (add, remove) = (ids("add"), ids("remove"));
     let new_name = text_arg(args, "new_name").filter(|n| *n != name);
-    if add.is_empty() && remove.is_empty() && new_name.is_none() {
-        return Err(t("바꿀 값이 없습니다 (add, remove, new_name 중 하나 이상)", "Nothing to change (pass add, remove, or new_name)").into());
+    let description = args["description"].as_str().map(|d| d.trim().to_owned()).filter(|d| *d != index.description);
+    if add.is_empty() && remove.is_empty() && new_name.is_none() && description.is_none() {
+        return Err(t(
+            "바꿀 값이 없습니다 (add, remove, new_name, description 중 하나 이상)",
+            "Nothing to change (pass add, remove, new_name, or description)",
+        )
+        .into());
     }
 
     // 모두 확인한 뒤에 한꺼번에 바꾼다
@@ -691,14 +832,14 @@ fn update_index(ctx: &Ctx, args: &Value) -> Result<String, String> {
             ));
         }
     }
+    if (new_name.is_some() || description.is_some()) && index.author.is_none() {
+        return Err(t(
+            "사람이 만들거나 고친 인덱스는 이름·설명을 바꿀 수 없습니다. 바꿀 내용을 사용자에게 알려 주세요",
+            "Indexes a person created or edited can't have their name or description changed. Tell the user what should change",
+        )
+        .into());
+    }
     if let Some(new_name) = &new_name {
-        if index.author.is_none() {
-            return Err(t(
-                "사람이 만들거나 고친 인덱스는 이름을 바꿀 수 없습니다. 사용자에게 알려 주세요",
-                "Indexes a person created or edited can't be renamed. Tell the user",
-            )
-            .into());
-        }
         if !store::is_valid_index_name(new_name) {
             return Err(t("이름은 영문·숫자·-·_ 만, 64자 이내로 쓸 수 있습니다", "Names can only use letters, numbers, - and _, up to 64").into());
         }
@@ -717,26 +858,27 @@ fn update_index(ctx: &Ctx, args: &Value) -> Result<String, String> {
             added += 1;
         }
     }
+    let described = description.is_some();
+    if let Some(description) = description {
+        index.description = description;
+    }
     let save = |err| tr!("저장하지 못했습니다: {err}", "Couldn't save: {err}");
     ctx.store.save_index(&index).map_err(save)?;
     let mut current = name.clone();
     if let Some(new_name) = new_name {
         ctx.store.rename_index(&name, &new_name).map_err(save)?;
-        // 옛 이름을 고른 세션은 새 이름을 따라간다
-        for session in ctx.sessions.lock().unwrap().values_mut() {
-            if session.index.as_deref() == Some(name.as_str()) {
-                session.index = Some(new_name.clone());
-            }
-        }
         current = new_name;
     }
 
     notify_changed();
-    let renamed = if current == name { String::new() } else { tr!(", 이름 '{name}' → '{current}'", ", renamed '{name}' → '{current}'") };
-    Ok(tr!(
-        "'{current}' 인덱스를 고쳤습니다: {added}개 넣음, {removed}개 뺌{renamed}",
-        "Updated index '{current}': {added} added, {removed} removed{renamed}"
-    ))
+    let mut changes = vec![tr!("{added}개 넣음, {removed}개 뺌", "{added} added, {removed} removed")];
+    if current != name {
+        changes.push(tr!("이름 '{name}' → '{current}'", "renamed '{name}' → '{current}'"));
+    }
+    if described {
+        changes.push(t("설명 바꿈", "description changed").into());
+    }
+    Ok(tr!("'{current}' 인덱스를 고쳤습니다: {}", "Updated index '{current}': {}", changes.join(", ")))
 }
 
 fn delete_index(ctx: &Ctx, name: &str) -> Result<String, String> {
@@ -762,7 +904,7 @@ fn export_indexes(ctx: &Ctx, args: &Value) -> Result<String, String> {
     } else if !names.is_empty() {
         Scope::Indexes(names)
     } else {
-        Scope::Indexes(vec![ctx.index().ok_or(t("내보낼 인덱스가 없습니다", "No index to export"))?])
+        return Err(t("indexes(인덱스 이름 목록)나 all을 주세요", "Pass indexes (a list of index names) or all").into());
     };
     let include_secrets = args["include_secrets"].as_bool().unwrap_or(false);
     if include_secrets && !all {
@@ -925,12 +1067,16 @@ mod tests {
     fn setup(name: &str) -> (Store, Sessions) {
         let root = std::env::temp_dir().join(format!("octo-mcp-test-{name}-{}", store::new_id()));
         let store = Store::at(root).unwrap();
-        store.save_index(&Index { name: "x".into(), contexts: vec![], author: None }).unwrap();
+        store.save_index(&Index { name: "x".into(), ..Index::default() }).unwrap();
         (store, Sessions::default())
     }
 
     fn ctx<'a>(store: &'a Store, sessions: &'a Sessions) -> Ctx<'a> {
-        Ctx { store, sessions, session: None, pinned: Some("x".into()) }
+        Ctx { store, sessions, session: None, pinned: None }
+    }
+
+    fn text(reply: &Value) -> &str {
+        reply["content"][0]["text"].as_str().unwrap()
     }
 
     #[test]
@@ -962,18 +1108,44 @@ mod tests {
     }
 
     #[test]
-    fn tools_are_listed_and_dispatched() {
+    fn indexes_are_chosen_per_call_not_per_session() {
         let (store, sessions) = setup("dispatch");
+        store.save_index(&Index { name: "pay".into(), description: "결제 정책".into(), ..Index::default() }).unwrap();
         let ctx = ctx(&store, &sessions);
         let names: Vec<_> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
-        for name in ["add_context", "update_context", "delete_context", "create_index", "update_index", "delete_index", "export_indexes", "import_indexes"] {
+        assert!(!names.contains(&"use_index".to_owned()));
+        for name in ["get_index", "load_context", "add_context", "create_index", "update_index", "export_indexes", "import_indexes"] {
             assert!(names.contains(&name.to_owned()), "{name}");
         }
 
-        let reply = call(&ctx, &json!({ "name": "add_context", "arguments": { "title": "t", "body": "b" } }));
-        assert_eq!(reply["isError"], false);
-        let toc = call(&ctx, &json!({ "name": "get_index" }));
-        assert!(toc["content"][0]["text"].as_str().unwrap().contains("unknown"));
+        // 인덱스를 안 정하면 목록과 함께 되묻는다
+        let missing = call(&ctx, &json!({ "name": "add_context", "arguments": { "title": "t", "body": "b" } }));
+        assert_eq!(missing["isError"], true);
+        assert!(text(&missing).contains("pay — 결제 정책"), "{}", text(&missing));
+        assert_eq!(call(&ctx, &json!({ "name": "get_index" }))["isError"], true);
+
+        // 한 세션에서 두 인덱스를 오가며 쓰고, 어느 인덱스의 id든 연다
+        call(&ctx, &json!({ "name": "add_context", "arguments": { "index": "x", "title": "t", "body": "from x" } }));
+        call(&ctx, &json!({ "name": "add_context", "arguments": { "index": "pay", "title": "refund", "body": "7일" } }));
+        assert!(text(&call(&ctx, &json!({ "name": "get_index", "arguments": { "index": "pay" } }))).contains("결제 정책"));
+        let id = store.index("x").unwrap().contexts[0].clone();
+        assert_eq!(text(&call(&ctx, &json!({ "name": "load_context", "arguments": { "id": id } }))), "from x");
+
+        // 어느 인덱스에도 없는 건 열지 않는다
+        let loose = Context { id: "loose".into(), title: "l".into(), summary: String::new(), source: Source::Document, author: None };
+        store.save_context(&loose).unwrap();
+        assert_eq!(call(&ctx, &json!({ "name": "load_context", "arguments": { "id": "loose" } }))["isError"], true);
+    }
+
+    #[test]
+    fn instructions_list_indexes_without_a_default() {
+        let (store, sessions) = setup("instructions");
+        store.save_index(&Index { name: "pay".into(), description: "결제 정책".into(), ..Index::default() }).unwrap();
+        let instructions = initialize(&ctx(&store, &sessions), &json!({}))["instructions"].as_str().unwrap().to_owned();
+        assert!(instructions.contains("pay — 결제 정책"), "{instructions}");
+        assert!(instructions.contains("get_index(index)"), "{instructions}");
+        // 설명이 없으면 목차 제목으로 대신한다
+        assert!(instructions.contains("x — "), "{instructions}");
     }
 
     fn human_context(store: &Store, id: &str) {
@@ -986,50 +1158,54 @@ mod tests {
         let (store, sessions) = setup("delete-ctx");
         let ctx = ctx(&store, &sessions);
         human_context(&store, "h");
-        store.save_index(&Index { name: "x".into(), contexts: vec!["h".into()], author: None }).unwrap();
-        assert!(delete_context(&ctx, "x", &json!({ "id": "h" })).is_err());
+        store.save_index(&Index { name: "x".into(), contexts: vec!["h".into()], ..Index::default() }).unwrap();
+        assert!(delete_context(&ctx, &json!({ "id": "h" })).is_err());
 
         add_context(&ctx, "x", &json!({ "title": "note", "body": "b" })).unwrap();
         let id = store.index("x").unwrap().contexts[1].clone();
-        store.save_index(&Index { name: "y".into(), contexts: vec![id.clone()], author: None }).unwrap();
-        delete_context(&ctx, "x", &json!({ "id": id })).unwrap();
+        store.save_index(&Index { name: "y".into(), contexts: vec![id.clone()], ..Index::default() }).unwrap();
+        delete_context(&ctx, &json!({ "id": id })).unwrap();
         assert!(store.context(&id).is_none());
         assert_eq!(store.index("x").unwrap().contexts, vec!["h".to_string()]);
         assert!(store.index("y").unwrap().contexts.is_empty());
     }
 
     #[test]
-    fn create_index_switches_the_session() {
+    fn create_index_takes_a_description() {
         let (store, sessions) = setup("create");
-        sessions.lock().unwrap().insert("s".into(), Session::default());
-        let ctx = Ctx { store: &store, sessions: &sessions, session: Some("s".into()), pinned: None };
-        assert!(create_index(&ctx, "통신").is_err());
-        assert!(create_index(&ctx, "x").is_err());
-        create_index(&ctx, "telecom").unwrap();
-        assert!(store.index("telecom").unwrap().author.is_some());
-        assert_eq!(ctx.index().as_deref(), Some("telecom"));
+        let ctx = ctx(&store, &sessions);
+        assert!(create_index(&ctx, &json!({ "name": "통신" })).is_err());
+        assert!(create_index(&ctx, &json!({ "name": "x" })).is_err());
+        let reply = create_index(&ctx, &json!({ "name": "bare" })).unwrap();
+        assert!(reply.contains("description"), "{reply}");
+        create_index(&ctx, &json!({ "name": "telecom", "description": "통신 마이데이터" })).unwrap();
+        let index = store.index("telecom").unwrap();
+        assert!(index.author.is_some());
+        assert_eq!(index.description, "통신 마이데이터");
     }
 
     #[test]
     fn update_index_respects_ownership() {
         let (store, sessions) = setup("update-index");
-        sessions.lock().unwrap().insert("s".into(), Session::default());
-        let ctx = Ctx { store: &store, sessions: &sessions, session: Some("s".into()), pinned: None };
+        let ctx = ctx(&store, &sessions);
         human_context(&store, "h");
-        // 사람 인덱스: 넣기는 되고, 사람 컨텍스트 빼기와 이름 바꾸기는 안 된다
+        // 사람 인덱스: 넣기는 되고, 사람 컨텍스트 빼기와 이름·설명 바꾸기는 안 된다
         assert!(update_index(&ctx, &json!({ "name": "x", "add": ["h"] })).is_ok());
         assert!(update_index(&ctx, &json!({ "name": "x", "add": ["missing"] })).is_err());
         assert!(update_index(&ctx, &json!({ "name": "x", "remove": ["h"] })).is_err());
         assert!(update_index(&ctx, &json!({ "name": "x", "new_name": "z" })).is_err());
+        assert!(update_index(&ctx, &json!({ "name": "x", "description": "내 설명" })).is_err());
         assert!(update_index(&ctx, &json!({ "name": "x" })).is_err());
+        assert!(update_index(&ctx, &json!({ "add": ["h"] })).is_err(), "name is required");
 
-        // 에이전트 인덱스: 다 된다. 세션은 새 이름을 따라간다
-        create_index(&ctx, "mine").unwrap();
-        update_index(&ctx, &json!({ "add": ["h"] })).unwrap();
-        update_index(&ctx, &json!({ "remove": ["h"], "new_name": "mine2" })).unwrap();
+        // 에이전트 인덱스: 다 된다
+        create_index(&ctx, &json!({ "name": "mine" })).unwrap();
+        update_index(&ctx, &json!({ "name": "mine", "add": ["h"], "description": "설명" })).unwrap();
+        update_index(&ctx, &json!({ "name": "mine", "remove": ["h"], "new_name": "mine2" })).unwrap();
         assert!(store.index("mine").is_none());
-        assert!(store.index("mine2").unwrap().contexts.is_empty());
-        assert_eq!(ctx.index().as_deref(), Some("mine2"));
+        let renamed = store.index("mine2").unwrap();
+        assert!(renamed.contexts.is_empty());
+        assert_eq!(renamed.description, "설명");
     }
 
     #[test]
@@ -1037,7 +1213,7 @@ mod tests {
         let (store, sessions) = setup("delete-index");
         let ctx = ctx(&store, &sessions);
         assert!(delete_index(&ctx, "x").is_err());
-        create_index(&ctx, "tmp").unwrap();
+        create_index(&ctx, &json!({ "name": "tmp" })).unwrap();
         human_context(&store, "h");
         update_index(&ctx, &json!({ "name": "tmp", "add": ["h"] })).unwrap();
         delete_index(&ctx, "tmp").unwrap();
@@ -1052,8 +1228,9 @@ mod tests {
         add_context(&ctx, "x", &json!({ "title": "note", "body": "b" })).unwrap();
         let zip = store.root().join("x.octo.zip");
         let path = zip.to_string_lossy();
-        assert!(export_indexes(&ctx, &json!({ "include_secrets": true })).is_err());
-        export_indexes(&ctx, &json!({ "path": path })).unwrap();
+        assert!(export_indexes(&ctx, &json!({ "path": path })).is_err(), "needs indexes or all");
+        assert!(export_indexes(&ctx, &json!({ "indexes": ["x"], "include_secrets": true })).is_err());
+        export_indexes(&ctx, &json!({ "indexes": ["x"], "path": path })).unwrap();
 
         let (other, other_sessions) = setup("transfer-other");
         let other_ctx = self::ctx(&other, &other_sessions);
@@ -1063,25 +1240,131 @@ mod tests {
         import_indexes(&other_ctx, &json!({ "path": path })).unwrap();
         let id = other.index("x-2").unwrap().contexts[0].clone();
         // 가져온 건 사람 것이라 에이전트가 못 지운다
-        assert!(delete_context(&other_ctx, "x-2", &json!({ "id": id })).is_err());
+        assert!(delete_context(&other_ctx, &json!({ "id": id })).is_err());
+    }
+
+    #[test]
+    fn file_uris_become_paths() {
+        assert_eq!(file_uri_path("file:///Users/me/my%20app/").as_deref(), Some("/Users/me/my app"));
+        assert_eq!(file_uri_path("file://localhost/w/%ED%86%B5").as_deref(), Some("/w/통"));
+        assert_eq!(file_uri_path("file:///w/100%").as_deref(), Some("/w/100%"));
+        assert_eq!(file_uri_path("https://example.com"), None);
+    }
+
+    fn folder_session<'a>(store: &'a Store, sessions: &'a Sessions, folder: &str) -> Ctx<'a> {
+        sessions.lock().unwrap().insert("s".into(), Session { roots: true, folders: Some(vec![folder.into()]), ..Session::default() });
+        Ctx { store, sessions, session: Some("s".into()), pinned: None }
+    }
+
+    #[test]
+    fn opened_indexes_become_hints_for_the_folder() {
+        let (store, sessions) = setup("folder");
+        store.save_index(&Index { name: "y".into(), ..Index::default() }).unwrap();
+        let ctx = folder_session(&store, &sessions, "/w/app");
+        assert!(ctx.hints().is_empty());
+
+        // 목차를 연 인덱스가 최근 것부터 쌓이고, 같은 폴더의 다음 세션 목록 맨 앞에 온다
+        get_index(&ctx, &json!({ "index": "y" })).unwrap();
+        get_index(&ctx, &json!({ "index": "x" })).unwrap();
+        let next_sessions = Sessions::default();
+        let next = folder_session(&store, &next_sessions, "/w/app/src");
+        assert_eq!(next.hints(), vec!["x", "y"]);
+        let list = list_indexes(&next);
+        assert!(list.starts_with("- x"), "{list}");
+        assert!(list.contains("최근") || list.contains("recently"), "{list}");
+
+        // 주소의 ?index=는 고정이 아니라 첫 힌트
+        let pinned = Ctx { pinned: Some("y".into()), ..folder_session(&store, &next_sessions, "/w/app") };
+        assert_eq!(pinned.hints(), vec!["y", "x"]);
+
+        // 새로 만든 인덱스도 이 프로젝트의 최근 목록에 든다
+        create_index(&ctx, &json!({ "name": "made" })).unwrap();
+        assert_eq!(folder_session(&store, &Sessions::default(), "/w/app").hints()[0], "made");
+    }
+
+    #[test]
+    fn folders_are_asked_over_the_open_stream() {
+        let mut stream = Vec::new();
+        let answer = thread::spawn(|| loop {
+            let pending = PENDING.lock().unwrap().iter().map(|(id, tx)| (id.clone(), tx.clone())).next();
+            if let Some((id, tx)) = pending {
+                let roots = json!([{ "uri": "file:///w/app", "name": "app" }, { "uri": "https://not-a-folder" }]);
+                tx.send(json!({ "jsonrpc": "2.0", "id": id, "result": { "roots": roots } })).unwrap();
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        });
+        assert_eq!(ask_folders(&mut stream), vec!["/w/app".to_string()]);
+        answer.join().unwrap();
+
+        let sent = String::from_utf8(stream).unwrap();
+        assert!(sent.contains("\"method\":\"roots/list\""), "{sent}");
+        assert!(sent.contains("event: message\ndata: "), "{sent}");
+    }
+
+    /// 실제 HTTP로: initialize(roots 지원) → tools/call이 SSE로 열려 roots/list를 묻고, 다른 연결로 답하면 결과가 이어서 온다
+    #[test]
+    fn http_call_asks_roots_then_lists_the_folder_hints_first() {
+        use std::io::{BufRead, BufReader};
+
+        let (store, _) = setup("http");
+        store.save_index(&Index { name: "app".into(), ..Index::default() }).unwrap();
+        store.remember_folder_index("/w/app", "app").unwrap();
+        let port = 47_700 + (std::process::id() % 200) as u16;
+        spawn(store, port).unwrap();
+        let url = super::url(port);
+        let post = |session: Option<&str>, body: Value| {
+            let request = ureq::post(&url).header("Accept", "application/json, text/event-stream");
+            let request = match session {
+                Some(session) => request.header("Mcp-Session-Id", session),
+                None => request,
+            };
+            request.send(body.to_string()).unwrap()
+        };
+
+        let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": { "roots": {} }, "clientInfo": { "name": "t" } } });
+        let response = post(None, init);
+        let session = response.headers().get("Mcp-Session-Id").unwrap().to_str().unwrap().to_owned();
+        let instructions = response.into_body().read_json::<Value>().unwrap()["result"]["instructions"].as_str().unwrap().to_owned();
+        assert!(instructions.contains("list_indexes"), "{instructions}");
+
+        let call = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "list_indexes" } });
+        let stream = post(Some(&session), call);
+        assert!(stream.headers().get("Content-Type").unwrap().to_str().unwrap().starts_with("text/event-stream"));
+        let events = BufReader::new(stream.into_body().into_reader());
+        let mut messages = events.lines().map(Result::unwrap).filter_map(|line| line.strip_prefix("data: ").map(str::to_owned));
+
+        let ask: Value = serde_json::from_str(&messages.next().unwrap()).unwrap();
+        assert_eq!(ask["method"], "roots/list");
+        let answer = json!({ "jsonrpc": "2.0", "id": ask["id"], "result": { "roots": [{ "uri": "file:///w/app/sub" }] } });
+        assert_eq!(post(Some(&session), answer).status(), 202);
+
+        let result: Value = serde_json::from_str(&messages.next().unwrap()).unwrap();
+        assert_eq!(result["id"], 2);
+        let text = result["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("- app"), "{text}");
+
+        // 폴더는 한 번만 묻는다: 다음 호출은 바로 JSON
+        let again = post(Some(&session), json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "list_indexes" } }));
+        assert!(again.headers().get("Content-Type").unwrap().to_str().unwrap().starts_with("application/json"));
     }
 
     #[test]
     fn update_only_touches_agent_contexts() {
         let (store, sessions) = setup("update");
         let ctx = ctx(&store, &sessions);
-        let human = Context { id: "h".into(), title: "h".into(), summary: String::new(), source: Source::Document, author: None };
-        store.save_context(&human).unwrap();
-        store.save_index(&Index { name: "x".into(), contexts: vec!["h".into()], author: None }).unwrap();
-        assert!(update_context(&ctx, "x", &json!({ "id": "h", "body": "x" })).is_err());
+        human_context(&store, "h");
+        store.save_index(&Index { name: "x".into(), contexts: vec!["h".into()], ..Index::default() }).unwrap();
+        assert!(update_context(&ctx, &json!({ "id": "h", "body": "x" })).is_err());
 
         add_context(&ctx, "x", &json!({ "title": "note", "body": "v1" })).unwrap();
         let id = store.index("x").unwrap().contexts[1].clone();
-        assert!(update_context(&ctx, "x", &json!({ "id": id })).is_err());
-        assert!(update_context(&ctx, "x", &json!({ "id": id, "path": std::env::temp_dir() })).is_err());
-        // 사람이 만든 항목과 같은 제목으로는 못 바꾼다
-        assert!(update_context(&ctx, "x", &json!({ "id": id, "title": "H" })).is_err());
-        update_context(&ctx, "x", &json!({ "id": id, "body": "v2", "summary": "요약" })).unwrap();
+        assert!(update_context(&ctx, &json!({ "id": id })).is_err());
+        assert!(update_context(&ctx, &json!({ "id": id, "path": std::env::temp_dir() })).is_err());
+        // 같은 인덱스의 사람이 만든 항목과 같은 제목으로는 못 바꾼다
+        assert!(update_context(&ctx, &json!({ "id": id, "title": "H" })).is_err());
+        update_context(&ctx, &json!({ "id": id, "body": "v2", "summary": "요약" })).unwrap();
         assert_eq!(store.document(&id), "v2");
         assert_eq!(store.context(&id).unwrap().summary, "요약");
     }
